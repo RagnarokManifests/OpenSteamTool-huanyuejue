@@ -21,7 +21,7 @@ namespace {
             if (size_t start = name.find_last_of("\\", last - 1); start != std::string::npos) {
                 AppId_t depotId = std::stoul(name.substr(start + 1, last - start - 1));
                 if (const auto& key = LuaConfig::GetDecryptionKey(depotId); !key.empty()) {
-                    if (KeySize >= key.size()) {
+                    if (Key && KeySize >= key.size()) {
                         LOG_DECRYPTIONKEY_INFO("Providing decryption key for depot {}: {}", depotId,
                                                spdlog::to_hex(key.data(), key.data() + key.size()));
                         memcpy(Key, key.data(), key.size());

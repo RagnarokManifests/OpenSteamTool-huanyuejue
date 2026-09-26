@@ -1366,7 +1366,7 @@ namespace Hooks_NetPacket_OnlineFix {
             LOG_ONLINEFIX_WARN("OnlineFix: encoded size {} exceeds buffer", g_cbSendNewBody);
             return false;
         }
-        if (!msg.SerializeToArray(g_SendNewBody, kMaxBodySize)) {
+        if (!msg.SerializeToArray(g_SendNewBody, static_cast<int>(sizeof(g_SendNewBody)))) {
             LOG_ONLINEFIX_WARN("OnlineFix: failed to SerializeToArray");
             return false;
         }
@@ -1433,7 +1433,7 @@ namespace Hooks_NetPacket_Cloud {
             case 2: {
                 uint64 len;
                 if (!ReadVarint(d, size, pos, len)) return false;
-                if (pos + len > size) return false;
+                if (len > size - pos) return false;
                 pos += static_cast<uint32>(len);
                 break;
             }
@@ -1761,6 +1761,7 @@ namespace {
                         const uint8* pBody, uint32 cbBody,
                         const uint8* pHdr, uint32 cbHdr)
     {
+        if (!targetJobName) return;
         LOG_NETPACKET_DEBUG("Recv target_job_name: {}", targetJobName);
         g_NeedReplaceBody = false;
         g_NeedReplaceHdr  = false;
@@ -1902,6 +1903,8 @@ namespace {
         // 也是同一对字段。认不出就直接过原函数，一个字节都不碰。
         if (!EnsurePacketLayout(pPacket))
             return oRecvPkt(pThis, pPacket);
+        // A packet whose buffer never got allocated has nothing to unpack.
+        if (!PktData(pPacket)) return oRecvPkt(pThis, pPacket);
 
         Hooks_NetPacket_RichPresence::TryInject(
             pThis, pPacket,

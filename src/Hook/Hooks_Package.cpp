@@ -145,6 +145,10 @@ namespace {
         }
 
         if (LuaConfig::HasDepot(appId,false)) {
+            // Steam can call us with a null output struct; claim ownership
+            // anyway (HasDepot already said this appid is configured) rather
+            // than dereferencing it.
+            if (!pOwn) return true;
             // 家庭共享借来的游戏不计入真拥有，避免后续被排除在注入之外
             bool isTrulyOwned = result && (pOwn->ExistInPackageNums > 1) && !pOwn->bFamilyShared && !pOwn->bBorrowed;
             if (isTrulyOwned) {

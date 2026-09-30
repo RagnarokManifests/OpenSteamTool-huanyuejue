@@ -1145,6 +1145,7 @@ namespace Hooks_NetPacket_RichPresence {
 
         if (newTracked != 0) {
             LOG_RICHPRESENCE_INFO("Tracking topmost appid {}", newTracked);
+            LuaConfig::PrewarmStatSteamId(newTracked);
             if (BuildInject(newTracked)) g_InjectPending = true;
         } else if (topmost == 0) {
             // Stack went empty — inject a clear so the cache reverts.

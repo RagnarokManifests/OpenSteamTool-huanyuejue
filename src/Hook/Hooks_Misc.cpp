@@ -1,6 +1,8 @@
 #include "Hooks_Misc.h"
 #include "HookMacros.h"
 #include "Utils/HookSupport/VehCommon.h"
+#include "Utils/CloudRedirect/CloudRedirectHost.h"
+#include "Utils/Config/LuaConfig.h"
 #include "dllmain.h"
 #include <algorithm>
 
@@ -33,6 +35,10 @@ namespace {
         if (!pGameID) return;
         AppId_t appId = static_cast<AppId_t>(pGameID->AppID(true));
         const char* cmdLine = VehCommon::GetArg<const char*>(ctx, 3);
+
+        // Resolve the stat SteamID in the background now, so a later
+        // GetStatSteamId on a hot path never blocks on HTTP.
+        LuaConfig::PrewarmStatSteamId(appId);
 
         // 每次命中均记录启动参数，用于区分 hook 未触发与启动参数缺失两种情况。
         LOG_MISC_DEBUG("SpawnProcess hit: appid {} cmd=\"{}\"", appId, cmdLine ? cmdLine : "<null>");

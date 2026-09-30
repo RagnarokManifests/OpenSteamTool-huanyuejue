@@ -8,6 +8,7 @@
 #include "Utils/SteamMetadata/IPCLoader.h"
 #include "Utils/SteamMetadata/PatternLoader.h"
 #include "Utils/SteamMetadata/SteamDiagnostics.h"
+#include "Utils/Support/AcfSizeRepair.h"
 #include "OSTPlatform/include/DynamicLibrary.h"
 #include "OSTPlatform/include/Thread.h"
 
@@ -306,6 +307,19 @@ static uint32_t InitThread(OSTPlatform::DynamicLibrary::ModuleHandle selfModule)
     // 超时回退看门狗：只在隔离启用时才有事可做，直连原版时不启线程。
     if (g_IsDiversionActive.load())
         OSTPlatform::Thread::StartDetached([] { return DiversionWatchdog(); });
+
+    // Fix library entries whose appmanifest SizeOnDisk is stuck at 0 (games
+    // showing "0 B" in the library). Own detached thread: it walks every
+    // install directory on disk and can take seconds. Idempotent, and Steam
+    // only re-reads these files on its next operation, so a restart after
+    // this has run is what refreshes the library view.
+    OSTPlatform::Thread::StartDetached([]() -> uint32_t {
+        const int repaired = AcfSizeRepair::RepairAll(SteamInstallPath);
+        if (repaired > 0)
+            LOG_INFO("AcfSizeRepair: repaired {} appmanifest file(s); restart "
+                     "Steam to refresh the library view", repaired);
+        return 0;
+    });
     return 0;
 }
 

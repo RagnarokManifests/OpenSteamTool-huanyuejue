@@ -232,9 +232,7 @@ bool InitializeSteamComponents()
 // All initialisation that touches the filesystem, loads modules, scans
 // memory, or installs detours runs here on a worker thread — we MUST NOT do
 // any of that from inside DllMain (loader lock).
-static uint32_t InitThread(OSTPlatform::DynamicLibrary::ModuleHandle selfModule) {
-    Log::Init(selfModule);
-    LOG_INFO("OpenSteamTool init thread started");
+static uint32_t InitThreadInner(OSTPlatform::DynamicLibrary::ModuleHandle selfModule) {
     LOG_INFO("OpenSteamTool attach: steamclient64 already mapped = {} ({})",
              g_steamClientMappedAtAttach,
              g_steamClientMappedAtAttach
@@ -321,6 +319,25 @@ static uint32_t InitThread(OSTPlatform::DynamicLibrary::ModuleHandle selfModule)
         return 0;
     });
     return 0;
+}
+
+// Barrier around InitThreadInner: any exception that escapes a hook install,
+// pattern load or config parse would otherwise reach std::terminate and take
+// Steam down with it. Log and bail instead — Steam runs unhooked, which is
+// strictly better than a crash on launch.
+static uint32_t InitThread(OSTPlatform::DynamicLibrary::ModuleHandle selfModule) {
+    Log::Init(selfModule);
+    LOG_INFO("OpenSteamTool init thread started");
+
+    try {
+        return InitThreadInner(selfModule);
+    } catch (const std::exception& e) {
+        LOG_ERROR("OpenSteamTool init aborted: {}", e.what());
+        return 1;
+    } catch (...) {
+        LOG_ERROR("OpenSteamTool init aborted: unknown exception");
+        return 1;
+    }
 }
 
 BOOL APIENTRY DllMain(HMODULE hModule, DWORD dwReason, PVOID pvReserved)

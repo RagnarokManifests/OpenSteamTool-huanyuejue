@@ -213,4 +213,11 @@ void Stop() {
     }
 }
 
+void Detach() {
+    g_running.store(false, std::memory_order_release);
+    if (g_watcherThread.joinable()) {
+        g_watcherThread.detach();
+    }
+}
+
 } // namespace ConfigFileWatcher

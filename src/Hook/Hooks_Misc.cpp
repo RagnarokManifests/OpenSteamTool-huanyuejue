@@ -164,14 +164,18 @@ namespace Hooks_Misc {
         return appid;
     }
 
-    
-    AppId_t ResolveAppId() {
-        if (g_OnlineFixRealAppIdOverride) return g_OnlineFixRealAppIdOverride;
+    AppId_t ResolvePipeAppId() {
         const AppId_t pipeAppId = GetAppIDForCurrentPipeWrap();
         if (pipeAppId == kOnlineFixAppId) {
             const AppId_t realAppId = g_OnlineFixRealAppId.load(std::memory_order_acquire);
             if (realAppId != 0) return realAppId;
         }
+        return pipeAppId;
+    }
+
+    AppId_t ResolveAppId() {
+        if (g_OnlineFixRealAppIdOverride) return g_OnlineFixRealAppIdOverride;
+        const AppId_t pipeAppId = ResolvePipeAppId();
         if (pipeAppId != 0) return pipeAppId;
         return g_OnlineFixRealAppId.load(std::memory_order_acquire);
     }
@@ -187,6 +191,10 @@ namespace Hooks_Misc {
 
     bool IsOnlineFixActive() {
         return g_OnlineFixRealAppId.load(std::memory_order_relaxed) != 0;
+    }
+
+    bool IsNetworkingSocketsActive() {
+        return g_NetworkingSocketsActive.load(std::memory_order_relaxed);
     }
 
     void NotifyNetworkingSocketsUsed() {

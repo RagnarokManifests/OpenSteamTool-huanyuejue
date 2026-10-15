@@ -35,14 +35,14 @@ namespace SteamClient {
     }
 
     void CoreUnhook() {
-        Hooks_CallBack::Uninstall();
-        Hooks_Decryption::Uninstall();
-        Hooks_IPC::Uninstall();
-        // Hooks_KeyValues::Uninstall();
-        Hooks_Manifest::Uninstall();
-        Hooks_Misc::Uninstall();
-        Hooks_NetPacket::Uninstall();
+        // Strict LIFO rollback: reverse order of Decryption -> IPC -> Manifest -> Misc -> NetPacket -> Package
         Hooks_Package::Uninstall();
+        Hooks_NetPacket::Uninstall();
+        Hooks_Misc::Uninstall();
+        Hooks_Manifest::Uninstall();
+        Hooks_IPC::Uninstall();
+        Hooks_Decryption::Uninstall();
+        Hooks_CallBack::Uninstall();
         VehCommon::DisarmAll();
         VehCommon::RemoveHandler();
     }

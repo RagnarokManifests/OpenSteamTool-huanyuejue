@@ -33,7 +33,7 @@ namespace {
         // Once P2P is up, leave 480 so the socket matches the 480 session cert.
         if (Hooks_Misc::ShouldReportOnlineFixAppId()) return;
 
-        AppId_t realAppId = Hooks_Misc::ResolveAppId();
+        AppId_t realAppId = Hooks_Misc::ResolvePipeAppId();
         if (!realAppId) return;
 
         GetAppIDResp resp{pWrite};
@@ -41,7 +41,7 @@ namespace {
 
         // Read what steamclient just wrote, decide whether to spoof.
         const AppId_t current = resp.returnValue();
-        if (current == realAppId) return;
+        if (current != Hooks_Misc::kOnlineFixAppId || current == realAppId) return;
         resp.set_returnValue(realAppId);
         LOG_IPC_INFO("GetAppID: spoof response {} -> {}", current, realAppId);
     }
@@ -83,7 +83,7 @@ namespace {
         GetAPICallResultReq req{pRead};
         if (!req.ok()) return;
 
-        AppId_t appId = Hooks_Misc::ResolveAppId();
+        AppId_t appId = Hooks_Misc::ResolvePipeAppId();
         LOG_IPC_DEBUG("{}, AppId={}", req.DebugString(),appId);
         for (const auto& entry : kAPICallResultHandlers) {
             if (entry.callbackId == req.iCallbackExpected()) {

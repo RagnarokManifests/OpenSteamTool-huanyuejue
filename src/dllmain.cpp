@@ -225,6 +225,15 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD dwReason, PVOID pvReserved)
             SteamClient::CoreUnhook();
             CloudRedirectHost::Shutdown();
         }
+        else if (pvReserved != nullptr && IsSteamHost())
+        {
+            // Process termination (ExitProcess): The OS has already terminated all secondary
+            // threads. Never join or wait on mutexes held by terminated threads under the loader
+            // lock. Proactively detach all joinable worker threads so CRT static destruction
+            // does not invoke std::terminate() -> abort().
+            ConfigFileWatcher::Detach();
+            LuaFileWatcher::Detach();
+        }
     }
 
     return TRUE;

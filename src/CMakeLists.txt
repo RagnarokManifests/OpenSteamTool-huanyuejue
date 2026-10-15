@@ -233,6 +233,17 @@ endif()
 # ---------------------------------------------------------------------------
 add_library(dwmapi SHARED
     dwmapi/dwmapi.cpp
+    dwmapi/dwmapi.def
+    dwmapi/dwmapi.rc
+)
+
+# ---------------------------------------------------------------------------
+# version.dll hijack — alternative loader DLL placed alongside Steam.
+# ---------------------------------------------------------------------------
+add_library(version SHARED
+    version/version.cpp
+    version/version.def
+    version/version.rc
 )
 
 # ---------------------------------------------------------------------------

@@ -42,6 +42,22 @@ configure_file(
 )
 
 # ---------------------------------------------------------------------------
+# Proxy DLL targets — dwmapi.dll and version.dll
+# Defined early so tools (ost-manager) can embed their binaries.
+# ---------------------------------------------------------------------------
+add_library(dwmapi SHARED
+    dwmapi/dwmapi.cpp
+    dwmapi/dwmapi.def
+    dwmapi/dwmapi.rc
+)
+
+add_library(version SHARED
+    version/version.cpp
+    version/version.def
+    version/version.rc
+)
+
+# ---------------------------------------------------------------------------
 # Dependency recipes (FetchContent-backed, cached at <repo>/.deps).
 # ---------------------------------------------------------------------------
 list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/cmake")
@@ -228,23 +244,6 @@ if(OST_TOKEER_URL)
         OST_TOKEER_URL="${OST_TOKEER_URL}")
 endif()
 
-# ---------------------------------------------------------------------------
-# dwmapi.dll hijack — small loader DLL placed alongside Steam.
-# ---------------------------------------------------------------------------
-add_library(dwmapi SHARED
-    dwmapi/dwmapi.cpp
-    dwmapi/dwmapi.def
-    dwmapi/dwmapi.rc
-)
-
-# ---------------------------------------------------------------------------
-# version.dll hijack — alternative loader DLL placed alongside Steam.
-# ---------------------------------------------------------------------------
-add_library(version SHARED
-    version/version.cpp
-    version/version.def
-    version/version.rc
-)
 
 # ---------------------------------------------------------------------------
 # xinput1_4.dll hijack — secondary loader DLL placed alongside Steam.

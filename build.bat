@@ -4,15 +4,25 @@ setlocal EnableDelayedExpansion
 REM Always run from the script directory.
 cd /d "%~dp0"
 
+REM Ensure Visual Studio environment is initialized if running from normal shell
+if "%INCLUDE%"=="" (
+    for /f "usebackq tokens=*" %%i in (`"%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe" -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath`) do (
+        set "VS_DIR=%%i"
+    )
+    if exist "!VS_DIR!\VC\Auxiliary\Build\vcvars64.bat" (
+        echo [INFO] Initializing Visual Studio environment from !VS_DIR!...
+        call "!VS_DIR!\VC\Auxiliary\Build\vcvars64.bat"
+    )
+    if exist "!VS_DIR!\Common7\IDE\CommonExtensions\Microsoft\CMake\CMake\bin" (
+        set "PATH=!VS_DIR!\Common7\IDE\CommonExtensions\Microsoft\CMake\CMake\bin;!VS_DIR!\Common7\IDE\CommonExtensions\Microsoft\CMake\Ninja;%PATH%"
+    )
+)
+
 REM ---------------------------------------------------------------------------
 REM Configurable build options
 REM   GENERATOR  - CMake generator (default: auto-detect)
 REM   ARCH       - Architecture for multi-config generators (default: x64)
-REM   CONFIGS    - Configurations to build, space-separated (default: Release Debug)
-REM
-REM Local builds compile without the self-updater (-DOST_ENABLE_UPDATER=OFF) so a
-REM build you paste next to Steam is never replaced on the next launch. Release
-REM builds published by CI keep it enabled.
+REM   CONFIGS    - Configurations to build, space-separated (default: Release)
 REM ---------------------------------------------------------------------------
 if "%GENERATOR%"=="" (
     where ninja >nul 2>nul
@@ -23,21 +33,7 @@ if "%GENERATOR%"=="" (
     )
 )
 if "%ARCH%"=="" set "ARCH=x64"
-if "%CONFIGS%"=="" set "CONFIGS=Release Debug"
-
-REM Where the tools live, as a cmake --build target directory. The tools are
-REM add_subdirectory'd with EXCLUDE_FROM_ALL, so under the Visual Studio
-REM generator they are not part of the top-level solution: cmake resolves the
-REM target to <build>\extract_tickets.vcxproj, which does not exist, and
-REM MSBuild fails with MSB1009. The tools have their own solution in
-REM build\tools, so build them from there. Ninja keeps every target in a single
-REM build tree, so the top-level directory works as-is.
-echo "%GENERATOR%" | findstr /I /C:"Visual Studio" >nul
-if not errorlevel 1 (
-    set "TOOLS_BUILD_DIR=build\tools"
-) else (
-    set "TOOLS_BUILD_DIR=build"
-)
+if "%CONFIGS%"=="" set "CONFIGS=Release"
 
 echo [INFO] Configuring with generator: %GENERATOR%
 echo "%GENERATOR%" | findstr /I /C:"Visual Studio" >nul
@@ -49,14 +45,16 @@ if not errorlevel 1 (
 if errorlevel 1 goto :fail
 
 for %%C in (%CONFIGS%) do (
-    echo [INFO] Building: %%C
+    echo [INFO] Building core OpenSteamTool for %%C
     cmake --build build --config %%C
     if errorlevel 1 goto :fail
 
-    REM extract_tickets is EXCLUDE_FROM_ALL, so build it explicitly. It lands in
-    REM build\tools\%%C\ rather than the shipped output directory.
+    echo [INFO] Building tool ost-manager for %%C
+    cmake --build build --config %%C --target ost-manager
+    if errorlevel 1 goto :fail
+
     echo [INFO] Building tool extract_tickets for %%C
-    cmake --build !TOOLS_BUILD_DIR! --config %%C --target extract_tickets
+    cmake --build build --config %%C --target extract_tickets
     if errorlevel 1 goto :fail
 )
 

@@ -207,6 +207,8 @@ namespace {
     constexpr uint32 HASH_JOB_NotifyRunningApps = Fnv1aHash("FamilyGroupsClient.NotifyRunningApps#1");
     constexpr uint32 HASH_JOB_GetUserStats = Fnv1aHash("Player.GetUserStats#1");
     constexpr uint32 HASH_JOB_GetManifestRequestCode = Fnv1aHash("ContentServerDirectory.GetManifestRequestCode#1");
+    constexpr uint32 HASH_JOB_GetGameAchievements = Fnv1aHash("Player.GetGameAchievements#1");
+    constexpr uint32 HASH_JOB_GetUserAchievements = Fnv1aHash("Player.GetUserAchievements#1");
 
 } // anonymous namespace
 
@@ -296,6 +298,13 @@ namespace Hooks_NetPacket_UserStats {
     // jobid_source -> PendingStatsJob mapping (eMsg 151 request -> eMsg 147 response)
     std::mutex g_JobMutex;
     std::unordered_map<uint64, PendingStatsJob> g_JobIdToPendingStats;
+
+    // appid -> group ids, captured from the GetGameAchievements schema so the
+    // GetUserAchievements reply can mark each group achievable.
+    std::unordered_map<AppId_t, std::vector<uint32>> g_GameAchGroups;
+    // jobid_source -> appid for Player.Get{Game,User}Achievements#1. Send and
+    // recv run on different threads, so both maps share g_JobMutex.
+    std::unordered_map<uint64, AppId_t> g_JobIdToAppId;
 
     // ── Send: CPlayer_GetUserStats_Request (eMsg 151) ──────────
     bool HandleSend_GetUserStats(const uint8* pBody, uint32 cbBody,
@@ -704,6 +713,124 @@ namespace Hooks_NetPacket_UserStats {
                 LOG_ACHIEVEMENT_DEBUG("ClientStoreUserStats response: patched body eresult to OK for app {}", appId);
             }
         }
+    }
+
+
+    // ══ New "groups" achievement path ══════════════════════════
+    //  Player.GetGameAchievements#1  (schema: groups + internal_key/name)
+    //  Player.GetUserAchievements#1  (per-user unlock state; blank for unowned)
+    // Minimal treatment, mirroring the 147 GetUserStats handler: force the user
+    // reply to eresult=OK and mark its groups achievable, and let the client
+    // render unlocks from the local UserGameStats .bin it already reads. No
+    // achievement unlock state is injected here (that is the fallback if the
+    // client turns out not to merge local stats on this path).
+
+    // ── Send: map jobid_source -> appid (lua games only) ──
+    void HandleSend_GetGameAchievements(const uint8* pBody, uint32 cbBody,
+                                        const uint8* pHdr, uint32 cbHdr)
+    {
+        CPlayer_GetGameAchievements_Request req;
+        if (!req.ParseFromArray(pBody, cbBody) || !req.has_appid()) return;
+        const AppId_t appId = req.appid();
+        if (!LuaConfig::HasDepot(appId)) return;
+        CMsgProtoBufHeader hdr;
+        if (hdr.ParseFromArray(pHdr, cbHdr) && hdr.has_jobid_source()) {
+            std::lock_guard<std::mutex> lock(g_JobMutex);
+            g_JobIdToAppId[hdr.jobid_source()] = appId;
+            LOG_ACHIEVEMENT_DEBUG("GetGameAchievements send: jobid={} -> appid={}", hdr.jobid_source(), appId);
+        }
+    }
+
+    void HandleSend_GetUserAchievements(const uint8* pBody, uint32 cbBody,
+                                        const uint8* pHdr, uint32 cbHdr)
+    {
+        CPlayer_GetUserAchievements_Request req;
+        if (!req.ParseFromArray(pBody, cbBody) || !req.has_appid()) return;
+        const AppId_t appId = req.appid();
+        if (!LuaConfig::HasDepot(appId)) return;
+        CMsgProtoBufHeader hdr;
+        if (hdr.ParseFromArray(pHdr, cbHdr) && hdr.has_jobid_source()) {
+            std::lock_guard<std::mutex> lock(g_JobMutex);
+            g_JobIdToAppId[hdr.jobid_source()] = appId;
+            LOG_ACHIEVEMENT_DEBUG("GetUserAchievements send: jobid={} -> appid={}", hdr.jobid_source(), appId);
+        }
+    }
+
+    // ── Recv: GetGameAchievements response -> capture group ids, pass through ──
+    void HandleRecv_GetGameAchievementsResponse(const uint8* pHdr, uint32 cbHdr,
+                                                const uint8* pBody, uint32 cbBody)
+    {
+        CMsgProtoBufHeader hdr;
+        if (!hdr.ParseFromArray(pHdr, cbHdr) || !hdr.has_jobid_target()) return;
+        AppId_t appId = 0;
+        {
+            std::lock_guard<std::mutex> lock(g_JobMutex);
+            auto it = g_JobIdToAppId.find(hdr.jobid_target());
+            if (it == g_JobIdToAppId.end()) return;
+            appId = it->second;
+            g_JobIdToAppId.erase(it);
+        }
+
+        CPlayer_GetGameAchievements_Response resp;
+        if (!resp.ParseFromArray(pBody, cbBody)) return;
+        std::vector<uint32> groups;
+        groups.reserve(static_cast<size_t>(resp.groups_size()));
+        for (const auto& g : resp.groups())
+            if (g.has_groupid()) groups.push_back(g.groupid());
+        LOG_ACHIEVEMENT_DEBUG("GetGameAchievements recv: app={} stored {} group(s)", appId, groups.size());
+        {
+            std::lock_guard<std::mutex> lock(g_JobMutex);
+            g_GameAchGroups[appId] = std::move(groups);
+        }
+        // Pass through: Valve's public schema is correct.
+    }
+
+    // ── Recv: GetUserAchievements response -> eresult OK + groups achievable ──
+    void HandleRecv_GetUserAchievementsResponse(const uint8* pHdr, uint32 cbHdr,
+                                                const uint8* pBody, uint32 cbBody)
+    {
+        CMsgProtoBufHeader hdr;
+        if (!hdr.ParseFromArray(pHdr, cbHdr) || !hdr.has_jobid_target()) return;
+        AppId_t appId = 0;
+        {
+            std::lock_guard<std::mutex> lock(g_JobMutex);
+            auto it = g_JobIdToAppId.find(hdr.jobid_target());
+            if (it == g_JobIdToAppId.end()) return;
+            appId = it->second;
+            g_JobIdToAppId.erase(it);
+        }
+        if (!LuaConfig::HasDepot(appId)) return;
+
+        // Header: force eresult OK so the client doesn't treat the game as denied.
+        hdr.set_eresult(static_cast<int32_t>(k_EResultOK));
+        g_cbNewHdr = static_cast<uint32>(hdr.ByteSizeLong());
+        if (g_cbNewHdr > kMaxHdrSize || !hdr.SerializeToArray(g_NewHdr, kMaxHdrSize)) return;
+        g_NeedReplaceHdr = true;
+
+        // Body: mark every group achievable; leave achievements for the client
+        // to fill from local stats.
+        CPlayer_GetUserAchievements_Response resp;
+        if (!resp.ParseFromArray(pBody, cbBody)) return;
+        size_t nGroups = 0;
+        std::vector<uint32> groupIds;
+        {
+            std::lock_guard<std::mutex> lock(g_JobMutex);
+            auto gi = g_GameAchGroups.find(appId);
+            if (gi != g_GameAchGroups.end()) groupIds = gi->second;
+        }
+        if (!groupIds.empty()) {
+            resp.clear_groups();
+            for (uint32 gid : groupIds) {
+                auto* g = resp.add_groups();
+                g->set_groupid(gid);
+                g->set_is_achievable(true);
+            }
+            nGroups = groupIds.size();
+        }
+        g_cbNewBody = static_cast<uint32>(resp.ByteSizeLong());
+        if (g_cbNewBody > kMaxBodySize || !resp.SerializeToArray(g_NewBody, kMaxBodySize)) return;
+        g_NeedReplaceBody = true;
+        LOG_ACHIEVEMENT_INFO("GetUserAchievements recv: app={} eresult=OK, {} group(s) achievable", appId, nGroups);
     }
 
 } // namespace Hooks_NetPacket_UserStats
@@ -1679,6 +1806,14 @@ namespace {
         case HASH_JOB_GetManifestRequestCode:
             return Hooks_NetPacket_Manifest::HandleSend(pBody, cbBody, pHdr, cbHdr);
 
+        case HASH_JOB_GetGameAchievements:
+            Hooks_NetPacket_UserStats::HandleSend_GetGameAchievements(pBody, cbBody, pHdr, cbHdr);
+            return false;
+
+        case HASH_JOB_GetUserAchievements:
+            Hooks_NetPacket_UserStats::HandleSend_GetUserAchievements(pBody, cbBody, pHdr, cbHdr);
+            return false;
+
         // ---- add new 151 service methods here ----
         }
         return false;
@@ -1780,6 +1915,14 @@ namespace {
 
         case HASH_JOB_GetManifestRequestCode:
             Hooks_NetPacket_Manifest::HandleRecv(pBody, cbBody, pHdr, cbHdr);
+            return;
+
+        case HASH_JOB_GetGameAchievements:
+            Hooks_NetPacket_UserStats::HandleRecv_GetGameAchievementsResponse(pHdr, cbHdr, pBody, cbBody);
+            return;
+
+        case HASH_JOB_GetUserAchievements:
+            Hooks_NetPacket_UserStats::HandleRecv_GetUserAchievementsResponse(pHdr, cbHdr, pBody, cbBody);
             return;
 
         // ---- add new 147 service methods here ----

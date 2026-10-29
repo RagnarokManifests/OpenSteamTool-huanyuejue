@@ -116,6 +116,7 @@ add_library(OpenSteamTool SHARED
     Utils/Config/LuaConfig.cpp
     Utils/Config/LuaFileWatcher.cpp
     Utils/CloudRedirect/CloudRedirectHost.cpp
+    Utils/Achievements/LocalAchievements.cpp
     Utils/HookSupport/VehCommon.cpp
     Utils/Logging/Log.cpp
     Utils/SteamMetadata/AchSchema.cpp

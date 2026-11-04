@@ -269,8 +269,16 @@ namespace {
         si.dwFlags = STARTF_USESHOWWINDOW;
         si.wShowWindow = SW_HIDE;
         PROCESS_INFORMATION pi{};
-        if (CreateProcessW(nullptr, cmd.data(), nullptr, nullptr, FALSE,
-                           CREATE_NO_WINDOW | DETACHED_PROCESS, nullptr, nullptr, &si, &pi)) {
+        // No DETACHED_PROCESS: powershell started without a console exits 0
+        // without running its -Command. Leave Steam's job object when it is
+        // allowed, so the helper outlives the Steam it is shutting down.
+        const DWORD flags = CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP;
+        BOOL ok = CreateProcessW(nullptr, cmd.data(), nullptr, nullptr, FALSE,
+                                 flags | CREATE_BREAKAWAY_FROM_JOB, nullptr, nullptr, &si, &pi);
+        if (!ok && GetLastError() == ERROR_ACCESS_DENIED)
+            ok = CreateProcessW(nullptr, cmd.data(), nullptr, nullptr, FALSE,
+                                flags, nullptr, nullptr, &si, &pi);
+        if (ok) {
             CloseHandle(pi.hThread);
             CloseHandle(pi.hProcess);
             LOG_INFO("ReleaseUpdater: Steam restart helper launched");

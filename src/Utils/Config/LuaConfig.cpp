@@ -11,6 +11,8 @@
 #include <cctype>
 #include <cstdint>
 #include <fstream>
+#include <iterator>
+#include <sstream>
 #include <string>
 #include <unordered_set>
 #include <vector>
@@ -848,9 +850,37 @@ namespace LuaConfig{
             g_fileMtime[filePath] = mtime;
         }
 
+        std::string source((std::istreambuf_iterator<char>(file)),
+                           std::istreambuf_iterator<char>());
+        // Editors such as Notepad save UTF-8 with a BOM, which Lua rejects.
+        if (source.starts_with("\xEF\xBB\xBF"))
+            source.erase(0, 3);
+
+        // Run the whole file as one chunk first, so `local` helpers stay
+        // visible to the functions that use them (manifest.lua scripts written
+        // by launchers define `local function ...` next to
+        // fetch_manifest_code). Fall back to statement-by-statement only when
+        // the file does not compile or stops on a runtime error, so one bad
+        // line still cannot keep the rest of the file from loading. Re-running
+        // statements is safe: each depot counts once per file.
+        lua_settop(g_lua_state, 0);
+        const std::string chunkName = "@" + path.filename().string();
+        bool wholeFileOk = false;
+        if (luaL_loadbuffer(g_lua_state, source.data(), source.size(), chunkName.c_str()) == LUA_OK) {
+            if (lua_pcall(g_lua_state, 0, 0, 0) == LUA_OK) {
+                wholeFileOk = true;
+            } else {
+                const char* err = lua_tostring(g_lua_state, -1);
+                LOG_WARN("{}: {} (retrying statement by statement)", path.filename().string(),
+                         err ? err : "unknown");
+            }
+        }
+        lua_settop(g_lua_state, 0);
+
+        std::istringstream lines(wholeFileOk ? std::string() : source);
         std::string chunk, line;
         int lineNo = 0;
-        while (std::getline(file, line)) {
+        while (std::getline(lines, line)) {
             ++lineNo;
             if (!chunk.empty()) chunk += '\n';
             chunk += line;

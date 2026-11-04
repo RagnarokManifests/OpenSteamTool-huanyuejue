@@ -3,6 +3,7 @@
 #include "OpenSteamToolBuildInfo.h"
 #include "OSTPlatform/include/Dialog.h"
 #include "OSTPlatform/include/DynamicLibrary.h"
+#include "OSTPlatform/include/Encoding.h"
 #include "OSTPlatform/include/Hash.h"
 #include "OSTPlatform/include/Http.h"
 #include "OSTPlatform/include/Thread.h"
@@ -377,39 +378,112 @@ namespace {
         return true;
     }
 
-    // Detached, hidden PowerShell: graceful -shutdown, wait for Steam to exit,
-    // start it again.
-    void RestartSteam() {
+    // Base64 of the UTF-16LE bytes, the form powershell -EncodedCommand takes.
+    std::wstring Base64Utf16(const std::wstring& text) {
+        static constexpr wchar_t kAlphabet[] =
+            L"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+        const auto* b = reinterpret_cast<const unsigned char*>(text.data());
+        const size_t n = text.size() * sizeof(wchar_t);
+        std::wstring out;
+        out.reserve((n + 2) / 3 * 4);
+        for (size_t i = 0; i < n; i += 3) {
+            const uint32_t v = (uint32_t{b[i]} << 16) |
+                               (i + 1 < n ? uint32_t{b[i + 1]} << 8 : 0) |
+                               (i + 2 < n ? uint32_t{b[i + 2]} : 0);
+            out += kAlphabet[(v >> 18) & 63];
+            out += kAlphabet[(v >> 12) & 63];
+            out += i + 1 < n ? kAlphabet[(v >> 6) & 63] : L'=';
+            out += i + 2 < n ? kAlphabet[v & 63] : L'=';
+        }
+        return out;
+    }
+
+    // Restart Steam so a staged update loads now.
+    //
+    // Steam runs inside a Windows job object, and every process it starts
+    // lands in that job and dies with it the moment Steam exits, before it can
+    // start Steam again; leaving the job (CREATE_BREAKAWAY_FROM_JOB) is not
+    // allowed. So the restart runs from a script that WMI starts: processes
+    // created through Win32_Process.Create belong to the WMI service, outside
+    // Steam's job. The short-lived PowerShell started here only asks WMI to
+    // run the script and exits. The script logs to ost-restart.log.
+    void RestartSteam(const std::string& steamDir) {
         const fs::path steamExe = OSTPlatform::DynamicLibrary::GetMainExecutablePath();
-        if (steamExe.empty()) return;
-        std::wstring exe = steamExe.wstring();
-        for (size_t p = exe.find(L'\''); p != std::wstring::npos; p = exe.find(L'\'', p + 2))
-            exe.insert(p, 1, L'\'');
+        if (steamExe.empty()) {
+            LOG_WARN("ReleaseUpdater: steam.exe path unknown; restart Steam manually");
+            return;
+        }
+        const fs::path dir = fs::path(steamDir) / "opensteamtool";
+        const fs::path script = dir / "ost-restart.ps1";
+        const fs::path log = dir / "ost-restart.log";
+        std::error_code ec;
+        fs::create_directories(dir, ec);
+
+        // Single-quoted PowerShell literals escape ' by doubling it.
+        auto quote = [](std::wstring v) {
+            for (size_t i = v.find(L'\''); i != std::wstring::npos; i = v.find(L'\'', i + 2))
+                v.insert(i, 1, L'\'');
+            return L"'" + v + L"'";
+        };
+
+        {
+            const std::wstring text =
+                L"$exe = " + quote(steamExe.wstring()) + L"\n"
+                L"$log = " + quote(log.wstring()) + L"\n"
+                L"function Note($m) { Add-Content -Path $log -Value (\"{0:HH:mm:ss} {1}\" -f (Get-Date), $m) }\n"
+                L"Note 'restart requested'\n"
+                L"& $exe -shutdown\n"
+                L"Wait-Process -Name steam -Timeout 90 -ErrorAction SilentlyContinue\n"
+                L"if (Get-Process -Name steam -ErrorAction SilentlyContinue) { Note 'steam still running after 90 s, not starting a second copy'; exit 1 }\n"
+                L"Start-Sleep -Seconds 2\n"
+                L"Start-Process -FilePath $exe\n"
+                L"Note 'steam started'\n";
+            // UTF-8 with a BOM: Windows PowerShell reads BOM-less scripts in
+            // the ANSI code page, which would mangle non-ASCII paths.
+            std::ofstream out(script, std::ios::binary | std::ios::trunc);
+            out << "\xEF\xBB\xBF" << OSTPlatform::Encoding::WideToUtf8(text);
+            if (!out) {
+                LOG_WARN("ReleaseUpdater: cannot write {}; restart Steam manually", script.string());
+                return;
+            }
+        }
+
+        // The hand-off goes in as -EncodedCommand: nesting the script path's
+        // quotes inside a quoted -Command cut the command line short, and the
+        // script never ran. WMI starts the script with its window hidden.
+        const std::wstring handOff =
+            L"$si = New-CimInstance -ClassName Win32_ProcessStartup -ClientOnly "
+            L"-Property @{ ShowWindow = [uint16]0 }\n"
+            L"$cl = 'powershell -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File \"' + " +
+            quote(script.wstring()) + L" + '\"'\n"
+            L"$r = Invoke-CimMethod -ClassName Win32_Process -MethodName Create "
+            L"-Arguments @{ CommandLine = $cl; ProcessStartupInformation = $si }\n"
+            L"exit [int]$r.ReturnValue\n";
         std::wstring cmd =
-            L"powershell -NoProfile -WindowStyle Hidden -Command \"& '" + exe + L"' -shutdown; "
-            L"Wait-Process -Name steam -Timeout 60 -ErrorAction SilentlyContinue; "
-            L"Start-Process '" + exe + L"'\"";
+            L"powershell -NoProfile -NonInteractive -WindowStyle Hidden -EncodedCommand " +
+            Base64Utf16(handOff);
 
         STARTUPINFOW si{ sizeof(si) };
         si.dwFlags = STARTF_USESHOWWINDOW;
         si.wShowWindow = SW_HIDE;
         PROCESS_INFORMATION pi{};
         // No DETACHED_PROCESS: powershell started without a console exits 0
-        // without running its -Command. Leave Steam's job object when it is
-        // allowed, so the helper outlives the Steam it is shutting down.
-        const DWORD flags = CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP;
-        BOOL ok = CreateProcessW(nullptr, cmd.data(), nullptr, nullptr, FALSE,
-                                 flags | CREATE_BREAKAWAY_FROM_JOB, nullptr, nullptr, &si, &pi);
-        if (!ok && GetLastError() == ERROR_ACCESS_DENIED)
-            ok = CreateProcessW(nullptr, cmd.data(), nullptr, nullptr, FALSE,
-                                flags, nullptr, nullptr, &si, &pi);
-        if (ok) {
-            CloseHandle(pi.hThread);
-            CloseHandle(pi.hProcess);
-            LOG_INFO("ReleaseUpdater: Steam restart helper launched");
-        } else {
+        // without running its -Command.
+        if (!CreateProcessW(nullptr, cmd.data(), nullptr, nullptr, FALSE, CREATE_NO_WINDOW,
+                            nullptr, nullptr, &si, &pi)) {
             LOG_WARN("ReleaseUpdater: restart helper failed (error={})", GetLastError());
+            return;
         }
+        // Wait for the hand-off so a failure is visible in the log.
+        DWORD code = 1;
+        if (WaitForSingleObject(pi.hProcess, 30000) == WAIT_OBJECT_0)
+            GetExitCodeProcess(pi.hProcess, &code);
+        CloseHandle(pi.hThread);
+        CloseHandle(pi.hProcess);
+        if (code == 0)
+            LOG_INFO("ReleaseUpdater: Steam restart scheduled through WMI ({})", script.string());
+        else
+            LOG_WARN("ReleaseUpdater: restart hand-off exited with {}", code);
     }
 
     void Run(const std::string& steamDir) {
@@ -470,7 +544,7 @@ namespace {
                 "OpenSteamTool " + manifest->version + " quedó instalado.\n\n"
                 "¿Reiniciar Steam ahora para aplicarlo?\n"
                 "(Si eliges No, se aplica la próxima vez que abras Steam.)"))
-            RestartSteam();
+            RestartSteam(steamDir);
     }
 
 } // namespace

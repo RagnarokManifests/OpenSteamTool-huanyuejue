@@ -180,6 +180,20 @@ target_compile_definitions(OpenSteamTool PRIVATE
     $<$<CONFIG:Debug>:OPENSTEAMTOOL_LOGGING_ENABLED>
 )
 
+# Update notice: published releases build with -DOST_ENABLE_UPDATER=ON so the
+# DLL asks before installing a newer release from OST_UPDATE_REPO. Off by
+# default, so a local build never offers to replace itself.
+option(OST_ENABLE_UPDATER "Ask to install newer GitHub releases" OFF)
+set(OST_UPDATE_REPO "RagnarokManifests/OpenSteamTool-huanyuejue" CACHE STRING
+    "GitHub owner/repo whose releases the update notice follows")
+if(OST_ENABLE_UPDATER)
+    target_sources(OpenSteamTool PRIVATE Utils/Update/ReleaseUpdater.cpp)
+    target_compile_definitions(OpenSteamTool PRIVATE
+        OST_ENABLE_UPDATER
+        OST_UPDATE_REPO="${OST_UPDATE_REPO}"
+    )
+endif()
+
 # ---------------------------------------------------------------------------
 # dwmapi.dll hijack — anti-cheat friendly loader DLL.
 # Steam 的 bin\vgui2_s.dll 静态导入 dwmapi，本代理被它连带加载进 steam.exe，

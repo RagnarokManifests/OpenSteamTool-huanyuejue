@@ -10,6 +10,9 @@
 #include "Utils/SteamMetadata/SteamDiagnostics.h"
 #include "Utils/Support/AcfSizeRepair.h"
 #include "Utils/Support/DepotManifestSync.h"
+#ifdef OST_ENABLE_UPDATER
+#include "Utils/Update/ReleaseUpdater.h"
+#endif
 #include "OSTPlatform/include/DynamicLibrary.h"
 #include "OSTPlatform/include/Thread.h"
 
@@ -310,6 +313,12 @@ static uint32_t InitThreadInner(OSTPlatform::DynamicLibrary::ModuleHandle selfMo
     // 超时回退看门狗：只在隔离启用时才有事可做，直连原版时不启线程。
     if (g_IsDiversionActive.load())
         OSTPlatform::Thread::StartDetached([] { return DiversionWatchdog(); });
+
+#ifdef OST_ENABLE_UPDATER
+    // Update notice: asks before installing a newer release; never silent.
+    if (Config::GetUpdateEnabled())
+        ReleaseUpdater::StartAsync(SteamInstallPath);
+#endif
 
     // Fix library entries whose appmanifest SizeOnDisk is stuck at 0 (games
     // showing "0 B" in the library). Own detached thread: it walks every

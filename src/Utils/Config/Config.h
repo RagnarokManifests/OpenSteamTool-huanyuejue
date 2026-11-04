@@ -43,6 +43,10 @@ namespace Config {
     CloudSettings GetCloudSettings();
     bool GetStatsEnableApi();
 
+    // [update] enabled — ask before installing a newer release (default true).
+    // Only builds compiled with OST_ENABLE_UPDATER check at all.
+    bool GetUpdateEnabled();
+
     // [presence] — friend broadcast mode: "spacewar" (default) or "none".
     // Anything other than "none" keeps the current broadcast behavior.
     bool GetPresenceBroadcastEnabled();
@@ -72,6 +76,8 @@ namespace Config {
 
     // [stats]
     inline bool statsEnableApi = true;
+    // [update]
+    inline bool updateEnabled = true;
 
     // [presence] — "spacewar" shows the real game name to friends (default),
     // "none" skips the name broadcast patches.

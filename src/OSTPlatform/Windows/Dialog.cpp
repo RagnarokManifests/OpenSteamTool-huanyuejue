@@ -15,4 +15,11 @@ void ShowWarning(std::string title, std::string message) {
                 MB_OK | MB_ICONWARNING | MB_TOPMOST);
 }
 
+bool AskYesNo(std::string title, std::string message) {
+    return MessageBoxW(nullptr,
+                       Encoding::Utf8ToWide(message).c_str(),
+                       Encoding::Utf8ToWide(title).c_str(),
+                       MB_YESNO | MB_ICONQUESTION | MB_TOPMOST | MB_SETFOREGROUND) == IDYES;
+}
+
 } // namespace OSTPlatform::Dialog

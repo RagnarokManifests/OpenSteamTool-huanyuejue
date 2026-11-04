@@ -75,6 +75,13 @@ timeout_connect_ms = 5000
 timeout_send_ms    = 10000
 timeout_recv_ms    = 10000
 
+[update]
+# Release builds check this fork's GitHub Releases when Steam starts and,
+# if there is a newer version, ask before downloading and installing it.
+# Declining a version stops it from being offered again. Set to false to
+# turn the check off.
+enabled = true
+
 [stats]
 # Automatically query https://stats.opensteamtool.com/{appid} for a recommended
 # SteamID when no Lua setStat(appid, "steamid") override exists.

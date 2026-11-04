@@ -314,7 +314,7 @@ namespace Hooks_NetPacket_UserStats {
         LOG_ACHIEVEMENT_DEBUG("Player::GetUserStats request: original body:\n{}", req.DebugString());
 
         AppId_t appId = req.appid();
-        const bool isOnlineFix = (appId == kOnlineFixAppId && Hooks_Misc::IsOnlineFixActive());
+        const bool isOnlineFix = (appId == Hooks_Misc::GetOnlineFixAppId() && Hooks_Misc::IsOnlineFixActive());
         if (isOnlineFix) {
             const AppId_t resolved = Hooks_Misc::ResolveAppId();
             if (resolved != 0) {
@@ -542,7 +542,7 @@ namespace Hooks_NetPacket_UserStats {
             return false;
         }
         AppId_t appId = static_cast<AppId_t>(req.game_id());
-        if (appId == kOnlineFixAppId && Hooks_Misc::IsOnlineFixActive()) {
+        if (appId == Hooks_Misc::GetOnlineFixAppId() && Hooks_Misc::IsOnlineFixActive()) {
             const AppId_t resolved = Hooks_Misc::ResolveAppId();
             if (resolved != 0) {
                 appId = resolved;
@@ -591,7 +591,7 @@ namespace Hooks_NetPacket_UserStats {
         }
 
         AppId_t appId = static_cast<AppId_t>(resp.game_id());
-        if (appId == kOnlineFixAppId && Hooks_Misc::IsOnlineFixActive()) {
+        if (appId == Hooks_Misc::GetOnlineFixAppId() && Hooks_Misc::IsOnlineFixActive()) {
             const AppId_t resolved = Hooks_Misc::ResolveAppId();
             if (resolved != 0) {
                 appId = resolved;
@@ -657,7 +657,7 @@ namespace Hooks_NetPacket_UserStats {
             return;
 
         AppId_t appId = static_cast<AppId_t>(resp.game_id());
-        if (appId == kOnlineFixAppId && Hooks_Misc::IsOnlineFixActive()) {
+        if (appId == Hooks_Misc::GetOnlineFixAppId() && Hooks_Misc::IsOnlineFixActive()) {
             const AppId_t resolved = Hooks_Misc::ResolveAppId();
             if (resolved != 0) {
                 appId = resolved;
@@ -1127,7 +1127,7 @@ namespace Hooks_NetPacket_RichPresence {
         // Owned games on top let the server's natural broadcast paint the
         // cache; -onlinefix games are already handled by the OnlineFix path.
         AppId_t newTracked = 0;
-        if (topmost != 0 && topmost != kOnlineFixAppId && LuaConfig::HasDepot(topmost))
+        if (topmost != 0 && topmost != Hooks_Misc::GetOnlineFixAppId() && LuaConfig::HasDepot(topmost))
             newTracked = topmost;
 
         if (g_PlayingAppId == newTracked) return;
@@ -1301,21 +1301,22 @@ namespace Hooks_NetPacket_OnlineFix {
             auto* game = msg.mutable_games_played(i);
             AppId_t appid = static_cast<AppId_t>(game->game_id() & UINT32_MAX);
 
-            // SpawnProcess rewrites pGameID to 480, so game_id is already 480.
-            // Fill game_extra_info with the real game name.
-            if (broadcast && appid == kOnlineFixAppId) {
+            // SpawnProcess rewrites pGameID to the fake AppId, so game_id
+            // already carries it. Fill game_extra_info with the real game name.
+            if (broadcast && Hooks_Misc::IsOnlineFixActive() &&
+                appid == Hooks_Misc::GetOnlineFixAppId()) {
                 AppId_t realAppId = Hooks_Misc::ResolveAppId();
                 // 只排除占位值，不再要求 appid 在 Lua 名单里：正版拥有的游戏
                 // 加 -onlinefix 联机时同样要显示游戏名，否则好友侧只看到 480。
-                if (realAppId && realAppId != kOnlineFixAppId) {
+                if (realAppId && realAppId != appid) {
                     std::string name = Hooks_Misc::GetGameNameByAppID(realAppId);
                     if (!name.empty()) {
                         game->set_game_extra_info(name);
                         patched = true;
                         didBroadcastRewrite = true;
                         rewrittenIndex = i;
-                        LOG_ONLINEFIX_INFO("OnlineFix: 480 -> name '{}' (real appid {})",
-                            name, realAppId);
+                        LOG_ONLINEFIX_INFO("OnlineFix: {} -> name '{}' (real appid {})",
+                            appid, name, realAppId);
                     }
                 }
             }
@@ -1326,7 +1327,7 @@ namespace Hooks_NetPacket_OnlineFix {
         // non-Steam game. Falls back to 480 if no shortcuts registered.
         if (broadcast && !didBroadcastRewrite) {
             AppId_t trackedId = Hooks_NetPacket_RichPresence::g_PlayingAppId;
-            if (trackedId != 0 && trackedId != kOnlineFixAppId && msg.games_played_size() > 0) {
+            if (trackedId != 0 && trackedId != Hooks_Misc::GetOnlineFixAppId() && msg.games_played_size() > 0) {
                 std::string name = Hooks_Misc::GetGameNameByAppID(trackedId);
                 if (!name.empty()) {
                     auto* topGame = msg.mutable_games_played(msg.games_played_size() - 1);
@@ -1742,7 +1743,7 @@ namespace {
             if (appId == 0) {
                 appId = Hooks_NetPacket_RichPresence::g_PlayingAppId.load(std::memory_order_relaxed);
             }
-            if (appId == kOnlineFixAppId && Hooks_Misc::IsOnlineFixActive()) {
+            if (appId == Hooks_Misc::GetOnlineFixAppId() && Hooks_Misc::IsOnlineFixActive()) {
                 const AppId_t resolved = Hooks_Misc::ResolveAppId();
                 if (resolved != 0) appId = resolved;
             }

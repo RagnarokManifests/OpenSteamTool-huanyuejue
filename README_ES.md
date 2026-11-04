@@ -102,6 +102,7 @@ La herramienta `extract_tickets` vuelca las cadenas hexadecimales de `AppTicket`
 - El parámetro no exige que el juego esté en la lista de desbloqueo de Lua; los juegos que posees de forma legítima también pueden usarlo para jugar en línea.
 - Si un juego se queda colgado en la pantalla de carga, muestra una pantalla negra o falla tras el inicio de sesión, añade `-realappid` junto a él: `-onlinefix -realappid`. Con eso el juego recibe su AppId real cuando pregunta a Steam qué juego es, en lugar del 480 suplantado.
 - Ambos comportamientos los necesitan juegos distintos y no se pueden distinguir automáticamente, así que se elige por partida: deja fuera `-realappid` en los títulos que necesitan 480 para conectar, y añádelo en los que se rompen con 480.
+- Usa `-onlinefix=<appid>` para que el juego se haga pasar por un AppId distinto de 480 (por ejemplo `-onlinefix=1234`), útil en juegos que bloquean el 480 o cuya lista de salas del 480 se llena con salas de otros juegos. Ese AppId tiene que ser gratuito o estar en tu cuenta, y todos los que jueguen juntos deben usar el mismo valor.
 
 ## Futuro
 - Soporte para la sincronización con Steam Cloud (este es un proyecto enorme).

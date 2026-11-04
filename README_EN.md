@@ -106,6 +106,7 @@ The `extract_tickets` tool dumps the `AppTicket` and `ETicket` hex strings you n
 - The parameter does not require the game to be in the Lua unlock list; games you genuinely own can use it for online play too.
 - If a game hangs on the loading screen, black-screens, or misbehaves after login, add `-realappid` alongside it: `-onlinefix -realappid`. With that, the game gets its real appid when it asks Steam which game it is, instead of the spoofed 480.
 - Both behaviours are needed by different games and cannot be told apart automatically, so this is per-launch: leave `-realappid` off for titles that need 480 to network, add it for titles that break on 480.
+- Use `-onlinefix=<appid>` to disguise the game as an AppId other than 480 (e.g. `-onlinefix=1234`), for games that block 480 or whose 480 lobby list fills up with other games' rooms. The AppId must be free or already owned by your account, and everyone playing together must use the same value.
 
 ## Future
 - Steam Cloud synchronization support.(This is a huge project)

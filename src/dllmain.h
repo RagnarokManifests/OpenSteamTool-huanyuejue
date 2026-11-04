@@ -47,7 +47,8 @@ inline char DiversionPath[kRuntimePathCapacity]    = {};
 inline char LuaDir[kRuntimePathCapacity]           = {};
 inline char ConfigPath[kRuntimePathCapacity]       = {};
 
-// The fake AppId used by -onlinefix (SpaceWar).
+// Default fake AppId used by -onlinefix (SpaceWar). A launch can pick a
+// different one with -onlinefix=<appid>; see Hooks_Misc::GetOnlineFixAppId.
 constexpr AppId_t kOnlineFixAppId = 480;
 
 #endif // DLLMAIN_H

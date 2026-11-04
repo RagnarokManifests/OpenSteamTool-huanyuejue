@@ -55,7 +55,11 @@ namespace {
 
     struct Manifest {
         std::string version;
-        std::vector<Asset> assets;
+        std::vector<Asset> assets;  // DLLs to install, with their SHA-256
+        // Release zip carrying those DLLs. When set, the zip is downloaded and
+        // unpacked instead of fetching each DLL as its own release asset.
+        std::string zipName;
+        std::string zipSha256;
     };
 
     std::string ReleaseUrl(const std::string& path) {
@@ -111,6 +115,8 @@ namespace {
         try {
             const toml::table tbl = toml::parse(res.body);
             m.version = tbl["version"].value_or(std::string());
+            m.zipName = tbl["zip"].value_or(std::string());
+            m.zipSha256 = Lower(tbl["zip_sha256"].value_or(std::string()));
             if (const auto* files = tbl["files"].as_table()) {
                 for (const char* name : kKnownAssets) {
                     if (auto sha = (*files)[name].value<std::string>(); sha && sha->size() == 64)
@@ -123,6 +129,12 @@ namespace {
         }
         if (m.version.empty() || m.assets.empty()) {
             LOG_WARN("ReleaseUpdater: update.toml has no version or files");
+            return std::nullopt;
+        }
+        // A zip name must be a plain file name with a full SHA-256.
+        if (!m.zipName.empty() &&
+            (m.zipSha256.size() != 64 || m.zipName.find_first_of("/\\") != std::string::npos)) {
+            LOG_WARN("ReleaseUpdater: update.toml zip entry is invalid");
             return std::nullopt;
         }
         return m;
@@ -160,9 +172,18 @@ namespace {
         return out;
     }
 
-    // Leftovers of a previous update: old images (free once Steam restarted)
-    // and half-downloaded files.
+    fs::path WorkDir(const std::string& steamDir) {
+        return fs::path(steamDir) / "opensteamtool" / "update-work";
+    }
+
+    // Leftovers of a previous update: old images (free once Steam restarted),
+    // half-downloaded files and the zip work folder.
     void Cleanup(const std::string& steamDir) {
+        {
+            std::error_code ec;
+            if (fs::exists(WorkDir(steamDir), ec))
+                fs::remove_all(WorkDir(steamDir), ec);
+        }
         for (const char* asset : kKnownAssets) {
             const fs::path target = TargetFor(steamDir, asset);
             for (const char* suffix : { kBackupSuffix, kStagedSuffix }) {
@@ -207,6 +228,110 @@ namespace {
             fs::remove(staged, ec);
             return false;
         }
+        return true;
+    }
+
+    bool ValidDll(const fs::path& path) {
+        std::error_code ec;
+        const auto size = fs::file_size(path, ec);
+        if (ec || size < kMinDllBytes || size > kMaxDllBytes) return false;
+        char mz[2] = {};
+        std::ifstream in(path, std::ios::binary);
+        return in.read(mz, 2) && mz[0] == 'M' && mz[1] == 'Z';
+    }
+
+    // Run Windows' own tar.exe (bundled since Windows 10 1803), which also
+    // reads zip archives, to unpack `zip` into `dir`.
+    bool Extract(const fs::path& zip, const fs::path& dir) {
+        wchar_t sysDir[MAX_PATH] = {};
+        if (!GetSystemDirectoryW(sysDir, MAX_PATH)) return false;
+        const fs::path tar = fs::path(sysDir) / L"tar.exe";
+        std::error_code ec;
+        if (!fs::exists(tar, ec)) {
+            LOG_WARN("ReleaseUpdater: {} not found, cannot unpack the update", tar.string());
+            return false;
+        }
+        std::wstring cmd = L"\"" + tar.wstring() + L"\" -xf \"" + zip.wstring() +
+                           L"\" -C \"" + dir.wstring() + L"\"";
+        STARTUPINFOW si{ sizeof(si) };
+        PROCESS_INFORMATION pi{};
+        if (!CreateProcessW(nullptr, cmd.data(), nullptr, nullptr, FALSE, CREATE_NO_WINDOW,
+                            nullptr, nullptr, &si, &pi)) {
+            LOG_WARN("ReleaseUpdater: tar.exe failed to start (error={})", GetLastError());
+            return false;
+        }
+        const DWORD wait = WaitForSingleObject(pi.hProcess, 120000);
+        DWORD code = 1;
+        if (wait == WAIT_OBJECT_0) GetExitCodeProcess(pi.hProcess, &code);
+        else TerminateProcess(pi.hProcess, 1);
+        CloseHandle(pi.hThread);
+        CloseHandle(pi.hProcess);
+        if (code != 0) LOG_WARN("ReleaseUpdater: tar.exe exited with {}", code);
+        return code == 0;
+    }
+
+    // Download the release zip, check it against zip_sha256, unpack it and
+    // stage every DLL listed in [files] as "<target>.ost-new" after checking
+    // each one's own SHA-256.
+    bool StageFromZip(const std::string& steamDir, const Manifest& m) {
+        const fs::path work = WorkDir(steamDir);
+        std::error_code ec;
+        fs::remove_all(work, ec);
+        ec.clear();
+        fs::create_directories(work / "files", ec);
+        if (ec) {
+            LOG_WARN("ReleaseUpdater: cannot create {} ({})", work.string(), ec.message());
+            return false;
+        }
+
+        const std::string url = ReleaseUrl("download/" + m.version + "/" + m.zipName);
+        constexpr size_t kMaxZipBytes = 64 * 1024 * 1024;
+        auto res = OSTPlatform::Http::Execute(L"GET", url.c_str(), nullptr, 0, kHeaders,
+                                              5000, 5000, 15000, 120000, kMaxZipBytes + 1);
+        if (!res.ok || res.status != 200 || res.body.size() < 4 || res.body.size() > kMaxZipBytes ||
+            res.body.compare(0, 2, "PK") != 0) {
+            LOG_WARN("ReleaseUpdater: download {} failed (HTTP {}, {} bytes)",
+                     url, res.status, res.body.size());
+            return false;
+        }
+
+        const fs::path zip = work / "update.zip";
+        {
+            std::ofstream out(zip, std::ios::binary | std::ios::trunc);
+            out.write(res.body.data(), static_cast<std::streamsize>(res.body.size()));
+            if (!out) {
+                LOG_WARN("ReleaseUpdater: cannot write {}", zip.string());
+                return false;
+            }
+        }
+        const std::string zipSha = Lower(OSTPlatform::Hash::Sha256OfFile(zip));
+        if (zipSha != m.zipSha256) {
+            LOG_WARN("ReleaseUpdater: SHA-256 mismatch for {} (expected {}, got {})",
+                     m.zipName, m.zipSha256, zipSha);
+            return false;
+        }
+        if (!Extract(zip, work / "files")) return false;
+
+        for (const auto& asset : m.assets) {
+            const fs::path unpacked = work / "files" / asset.name;
+            if (!ValidDll(unpacked)) {
+                LOG_WARN("ReleaseUpdater: {} missing or not a DLL in {}", asset.name, m.zipName);
+                return false;
+            }
+            const std::string actual = Lower(OSTPlatform::Hash::Sha256OfFile(unpacked));
+            if (actual != asset.sha256) {
+                LOG_WARN("ReleaseUpdater: SHA-256 mismatch for {} in {} (expected {}, got {})",
+                         asset.name, m.zipName, asset.sha256, actual);
+                return false;
+            }
+            const fs::path staged = WithSuffix(TargetFor(steamDir, asset.name), kStagedSuffix);
+            if (!MoveFileExW(unpacked.wstring().c_str(), staged.wstring().c_str(),
+                             MOVEFILE_REPLACE_EXISTING | MOVEFILE_COPY_ALLOWED)) {
+                LOG_WARN("ReleaseUpdater: cannot stage {} (error={})", staged.string(), GetLastError());
+                return false;
+            }
+        }
+        fs::remove_all(work, ec);
         return true;
     }
 
@@ -314,14 +439,23 @@ namespace {
             return;
         }
 
-        for (const auto& asset : manifest->assets) {
-            if (!Download(steamDir, manifest->version, asset)) {
-                Cleanup(steamDir);
-                OSTPlatform::Dialog::ShowWarning(title,
-                    "No se pudo descargar la actualización " + manifest->version +
-                    ".\nSe volverá a intentar la próxima vez que abras Steam.");
-                return;
+        bool downloaded = true;
+        if (!manifest->zipName.empty()) {
+            downloaded = StageFromZip(steamDir, *manifest);
+        } else {
+            for (const auto& asset : manifest->assets) {
+                if (!Download(steamDir, manifest->version, asset)) {
+                    downloaded = false;
+                    break;
+                }
             }
+        }
+        if (!downloaded) {
+            Cleanup(steamDir);
+            OSTPlatform::Dialog::ShowWarning(title,
+                "No se pudo descargar la actualización " + manifest->version +
+                ".\nSe volverá a intentar la próxima vez que abras Steam.");
+            return;
         }
         if (!Install(steamDir, manifest->assets)) {
             Cleanup(steamDir);

@@ -7,6 +7,7 @@
 
 #include <lua.hpp>
 
+#include <algorithm>
 #include <cctype>
 #include <cstdint>
 #include <fstream>
@@ -726,6 +727,46 @@ namespace LuaConfig{
         g_fileMtime.erase(filePath);
     }
 
+    // Unload every tracked file that lives under `directory`. Deleting or
+    // moving a whole folder only raises one change for the folder itself, so
+    // the per-file unloads never arrive on their own.
+    void UnloadDirectory(const std::string& directory) {
+        std::string prefix = directory;
+        while (!prefix.empty() && (prefix.back() == '\\' || prefix.back() == '/'))
+            prefix.pop_back();
+        if (prefix.empty()) return;
+        prefix += '\\';
+
+        auto underPrefix = [&](const std::string& path) {
+            if (path.size() <= prefix.size()) return false;
+            return std::equal(prefix.begin(), prefix.end(), path.begin(), [](char a, char b) {
+                auto norm = [](char c) {
+                    return c == '/' ? '\\' : static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+                };
+                return norm(a) == norm(b);
+            });
+        };
+
+        std::vector<std::string> victims;
+        for (const auto& [file, _] : g_fileParseSequence)
+            if (underPrefix(file)) victims.push_back(file);
+        for (const auto& file : victims)
+            UnloadFile(file);
+        if (!victims.empty())
+            LOG_PACKAGE_INFO("UnloadDirectory: unloaded {} Lua file(s) under {}", victims.size(), directory);
+    }
+
+    static std::vector<std::string> CollectLuaFiles(const std::string& directory);
+
+    // Parse every Lua file under a folder that appeared after startup (pasted
+    // or renamed into a watched directory). Unlike ParseDirectory it keeps the
+    // pending additions so the license refresh picks them up.
+    void ParseSubdirectory(const std::string& directory) {
+        if (!Initialize()) return;
+        for (const auto& filePath : CollectLuaFiles(directory))
+            ParseFile(filePath);
+    }
+
     std::vector<AppId_t> TakePendingRemovals() {
         std::vector<AppId_t> result;
         result.swap(g_pendingRemovals);
@@ -736,6 +777,15 @@ namespace LuaConfig{
         std::vector<AppId_t> result;
         result.swap(g_pendingAdditions);
         return result;
+    }
+
+    // ".lua" in any letter case: packs made on other tools ship "1234.LUA" too.
+    static bool IsLuaExtension(const std::filesystem::path& path) {
+        const std::string ext = path.extension().string();
+        return ext.size() == 4 &&
+               std::equal(ext.begin(), ext.end(), ".lua", [](char a, char b) {
+                   return std::tolower(static_cast<unsigned char>(a)) == b;
+               });
     }
 
     static std::vector<std::string> CollectLuaFiles(const std::string& directory) {
@@ -758,7 +808,7 @@ namespace LuaConfig{
                 std::error_code fec;
                 if (entry.is_directory(fec)) {
                     pending.push_back(entry.path());
-                } else if (entry.is_regular_file(fec) && entry.path().extension() == ".lua") {
+                } else if (entry.is_regular_file(fec) && IsLuaExtension(entry.path())) {
                     files.push_back(entry.path().string());
                 }
             }

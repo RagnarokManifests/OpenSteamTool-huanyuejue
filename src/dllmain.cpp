@@ -9,6 +9,7 @@
 #include "Utils/SteamMetadata/PatternLoader.h"
 #include "Utils/SteamMetadata/SteamDiagnostics.h"
 #include "Utils/Support/AcfSizeRepair.h"
+#include "Utils/Support/DepotManifestSync.h"
 #include "OSTPlatform/include/DynamicLibrary.h"
 #include "OSTPlatform/include/Thread.h"
 
@@ -286,6 +287,10 @@ static uint32_t InitThreadInner(OSTPlatform::DynamicLibrary::ModuleHandle selfMo
     watchDirs.push_back(std::string(LuaDir));
     for (const auto& dir : watchDirs)
         LuaConfig::ParseDirectory(dir);
+    // Depot manifests shipped next to the Lua scripts go into depotcache so
+    // Steam does not have to download them.
+    for (const auto& dir : watchDirs)
+        DepotManifestSync::InstallFromDirectory(dir, SteamInstallPath);
 
     LuaFileWatcher::Start(watchDirs);
     ConfigFileWatcher::Start(ConfigPath, LuaDir);

@@ -3,11 +3,14 @@
 #include "Utils/Config/LuaConfig.h"
 #include "Utils/CloudRedirect/CloudRedirectHost.h"
 #include "Utils/Logging/Log.h"
+#include "Utils/Support/DepotManifestSync.h"
 #include "OSTPlatform/include/DirectoryWatch.h"
+#include "dllmain.h"
 
 #include <algorithm>
 #include <atomic>
 #include <cctype>
+#include <filesystem>
 #include <thread>
 #include <unordered_map>
 
@@ -66,10 +69,17 @@ void MergeChanges(
     std::vector<std::string>& order,
     const std::vector<FileChange>& newChanges) {
     for (const auto& ch : newChanges) {
-        if (!accumulated.contains(ch.path)) {
+        auto it = accumulated.find(ch.path);
+        if (it == accumulated.end()) {
             order.push_back(ch.path);
+            accumulated.emplace(ch.path, ch.action);
+            continue;
         }
-        accumulated[ch.path] = ch.action;
+        // A pasted folder reports "added" then "modified" while its files are
+        // written; keep "added" so the folder is still scanned as new.
+        if (it->second == ChangeAction::Added && ch.action == ChangeAction::Modified)
+            continue;
+        it->second = ch.action;
     }
 }
 
@@ -97,15 +107,37 @@ std::vector<FileChange> ToFileChanges(
 }
 
 void ProcessChanges(const std::vector<FileChange>& changes) {
+    // Watches are recursive, so three kinds of change arrive here: Lua files,
+    // depot manifests shipped next to them (SteamTools layout), and whole
+    // folders. A folder deleted, moved away or pasted in raises a single
+    // change for the folder, not one per file inside it.
     std::vector<FileChange> luaChanges;
+    std::vector<std::string> removedDirs;
+    std::vector<std::string> addedDirs;
     for (const auto& change : changes) {
         if (IsLuaFile(change.path)) {
             luaChanges.push_back(change);
+        } else if (DepotManifestSync::IsManifestFile(change.path)) {
+            if (change.action != ChangeAction::Removed)
+                DepotManifestSync::InstallFile(change.path, SteamInstallPath);
+        } else if (change.action == ChangeAction::Removed) {
+            // Gone already, so it cannot be checked; unloading a path with no
+            // tracked Lua files under it is a no-op.
+            removedDirs.push_back(change.path);
+        } else if (change.action == ChangeAction::Added) {
+            // Only new folders: a folder's own "modified" change fires every
+            // time a file inside it is written and is already covered above.
+            std::error_code ec;
+            if (std::filesystem::is_directory(change.path, ec))
+                addedDirs.push_back(change.path);
         }
     }
-    if (luaChanges.empty()) return;
+    if (luaChanges.empty() && removedDirs.empty() && addedDirs.empty()) return;
 
-    LOG_PACKAGE_DEBUG("Processing {} Lua file change(s)", luaChanges.size());
+    LOG_PACKAGE_DEBUG("Processing {} Lua file and {} folder change(s)",
+                      luaChanges.size(), removedDirs.size() + addedDirs.size());
+    for (const auto& dir : removedDirs)
+        LuaConfig::UnloadDirectory(dir);
     for (const auto& change : luaChanges) {
         LOG_PACKAGE_TRACE("Lua file {}: {}", ToString(change.action), change.path);
         if (change.action == ChangeAction::Removed) {
@@ -113,6 +145,11 @@ void ProcessChanges(const std::vector<FileChange>& changes) {
         } else {
             LuaConfig::ParseFile(change.path);
         }
+    }
+    for (const auto& dir : addedDirs) {
+        LOG_PACKAGE_DEBUG("Lua folder added: {}", dir);
+        LuaConfig::ParseSubdirectory(dir);
+        DepotManifestSync::InstallFromDirectory(dir, SteamInstallPath);
     }
 
     Hooks_Package::NotifyLicenseChanged();

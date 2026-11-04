@@ -4,6 +4,8 @@
 #include "Utils/Config/LuaFileWatcher.h"
 #include "Utils/Config/ConfigFileWatcher.h"
 #include "Utils/Logging/Log.h"
+#include "Utils/Support/DepotManifestSync.h"
+#include "dllmain.h"
 #include "OSTPlatform/include/DirectoryWatch.h"
 
 #include <atomic>
@@ -56,6 +58,8 @@ void RestartLuaWatcher() {
 
     LuaFileWatcher::Stop();
     LuaConfig::ReloadDirectories(watchDirs);
+    for (const auto& dir : watchDirs)
+        DepotManifestSync::InstallFromDirectory(dir, SteamInstallPath);
     LuaFileWatcher::Start(watchDirs);
 
     Hooks_Package::NotifyLicenseChanged();

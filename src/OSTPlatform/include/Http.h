@@ -20,6 +20,9 @@ namespace OSTPlatform::Http {
                    uint32_t timeoutResolve = 5000,
                    uint32_t timeoutConnect = 5000,
                    uint32_t timeoutSend = 10000,
-                   uint32_t timeoutRecv = 10000);
+                   uint32_t timeoutRecv = 10000,
+                   // Upper bound on the response body read into memory. The default
+                   // suits small metadata (TOML/JSON); larger pages must raise it.
+                   uint32_t maxBodyBytes = 256 * 1024);
 
 } // namespace OSTPlatform::Http

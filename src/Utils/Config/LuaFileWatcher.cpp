@@ -260,4 +260,10 @@ void Stop() {
     }
 }
 
+void AbandonOnProcessExit() {
+    g_running = false;
+    if (g_watcherThread.joinable())
+        g_watcherThread.detach();
+}
+
 } // namespace LuaFileWatcher

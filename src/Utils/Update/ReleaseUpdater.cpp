@@ -436,7 +436,11 @@ namespace {
                 L"Wait-Process -Name steam -Timeout 90 -ErrorAction SilentlyContinue\n"
                 L"if (Get-Process -Name steam -ErrorAction SilentlyContinue) { Note 'steam still running after 90 s, not starting a second copy'; exit 1 }\n"
                 L"Start-Sleep -Seconds 2\n"
-                L"Start-Process -FilePath $exe\n"
+                // Steam's own folder as working directory: WMI starts this
+                // script in System32, and a Steam started from there launches
+                // bin\\SteamService.exe without finding tier0_s.dll and friends
+                // ("The specified module could not be found").
+                L"Start-Process -FilePath $exe -WorkingDirectory (Split-Path -Parent $exe)\n"
                 L"Note 'steam started'\n";
             // UTF-8 with a BOM: Windows PowerShell reads BOM-less scripts in
             // the ANSI code page, which would mangle non-ASCII paths.
@@ -457,7 +461,8 @@ namespace {
             L"$cl = 'powershell -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File \"' + " +
             quote(script.wstring()) + L" + '\"'\n"
             L"$r = Invoke-CimMethod -ClassName Win32_Process -MethodName Create "
-            L"-Arguments @{ CommandLine = $cl; ProcessStartupInformation = $si }\n"
+            L"-Arguments @{ CommandLine = $cl; CurrentDirectory = " +
+            quote(steamExe.parent_path().wstring()) + L"; ProcessStartupInformation = $si }\n"
             L"exit [int]$r.ReturnValue\n";
         std::wstring cmd =
             L"powershell -NoProfile -NonInteractive -WindowStyle Hidden -EncodedCommand " +

@@ -391,6 +391,15 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD dwReason, PVOID pvReserved)
             SteamClient::CoreUnhook();
             CloudRedirectHost::Shutdown();
         }
+        else
+        {
+            // Process exit: the watcher threads are gone already. Their
+            // std::thread objects must not be destroyed while still joinable,
+            // or the module's static destructors call std::terminate and Steam
+            // exits with 0xc0000409 inside this DLL.
+            ConfigFileWatcher::AbandonOnProcessExit();
+            LuaFileWatcher::AbandonOnProcessExit();
+        }
     }
 
     return TRUE;

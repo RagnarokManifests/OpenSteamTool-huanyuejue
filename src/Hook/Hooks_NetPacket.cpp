@@ -1,19 +1,24 @@
 #include "Hooks_NetPacket.h"
+#include "Utils/SteamMetadata/AchSchema.h"
 #include "Utils/SteamMetadata/ManifestClient.h"
 #include "Utils/Config/Config.h"
 #include "Hooks_Misc.h"
+#include "Hooks_Package.h"
 #include "HookMacros.h"
 #include "dllmain.h"
 #include "Utils/Tickets/AppTicket.h"
 #include "Utils/Tickets/LegacyCDKey.h"
 #include "Utils/Support/FnvHash.h"
 #include "Utils/CloudRedirect/CloudRedirectHost.h"
+#include "Utils/Achievements/LocalAchievements.h"
+#include "OSTPlatform/include/Hash.h"
 #include <atomic>
 #include <chrono>
 #include <excpt.h>
 #include <cstring>
 #include <deque>
 #include <filesystem>
+#include <format>
 #include <future>
 #include <mutex>
 #include <string_view>
@@ -162,8 +167,9 @@ namespace {
                                   const uint8* pNewHdr, uint32 cbNewHdr,
                                   const uint8* pNewBody, uint32 cbNewBody)
     {
+        constexpr uint32 kMaxPayload = sizeof(g_RecvPacketPool[0]) - sizeof(MsgHdr);
+        if (cbNewHdr > kMaxPayload || cbNewBody > kMaxPayload - cbNewHdr) return;
         uint32 newSize = sizeof(MsgHdr) + cbNewHdr + cbNewBody;
-        if (newSize > sizeof(g_RecvPacketPool[0])) return;
 
         uint8* buf = g_RecvPacketPool[g_RecvPacketPoolIdx];
         const MsgHdr* orig = reinterpret_cast<const MsgHdr*>(PktData(p));
@@ -185,8 +191,9 @@ namespace {
                                     const uint8* pNewBody, uint32 cbNewBody,
                                     uint32* pNewSize)
     {
+        constexpr uint32 kMaxPayload = sizeof(g_SendPacketPool[0]) - sizeof(MsgHdr);
+        if (cbHdr > kMaxPayload || cbNewBody > kMaxPayload - cbHdr) return nullptr;
         *pNewSize = sizeof(MsgHdr) + cbHdr + cbNewBody;
-        if (*pNewSize > sizeof(g_SendPacketPool[0])) return nullptr;
 
         uint8* buf = g_SendPacketPool[g_SendPacketPoolIdx];
         const MsgHdr* orig = reinterpret_cast<const MsgHdr*>(pubData);
@@ -203,6 +210,8 @@ namespace {
     constexpr uint32 HASH_JOB_NotifyRunningApps = Fnv1aHash("FamilyGroupsClient.NotifyRunningApps#1");
     constexpr uint32 HASH_JOB_GetUserStats = Fnv1aHash("Player.GetUserStats#1");
     constexpr uint32 HASH_JOB_GetManifestRequestCode = Fnv1aHash("ContentServerDirectory.GetManifestRequestCode#1");
+    constexpr uint32 HASH_JOB_GetGameAchievements = Fnv1aHash("Player.GetGameAchievements#1");
+    constexpr uint32 HASH_JOB_GetUserAchievements = Fnv1aHash("Player.GetUserAchievements#1");
 
 } // anonymous namespace
 
@@ -284,14 +293,58 @@ namespace Hooks_NetPacket_AccessToken {
 // ════════════════════════════════════════════════════════════════
 namespace Hooks_NetPacket_UserStats {
 
-    // jobid_source -> appid mapping (eMsg 151 request -> eMsg 147 response)
+    struct PendingStatsJob {
+        AppId_t     appId = 0;
+        std::string shaSchema;
+    };
+
+    // jobid_source -> PendingStatsJob mapping (eMsg 151 request -> eMsg 147 response)
+    std::mutex g_JobMutex;
+    std::unordered_map<uint64, PendingStatsJob> g_JobIdToPendingStats;
+
+    // appid -> group ids, captured from the GetGameAchievements schema so the
+    // GetUserAchievements reply can mark each group achievable.
+    std::unordered_map<AppId_t, std::vector<uint32>> g_GameAchGroups;
+    // jobid_source -> appid for Player.Get{Game,User}Achievements#1. Send and
+    // recv run on different threads, so both maps share g_JobMutex.
     std::unordered_map<uint64, AppId_t> g_JobIdToAppId;
+
+    // appid -> [ (internal_key, internal_name) ], captured from the
+    // GetGameAchievements schema so the GetUserAchievements reply can emit each
+    // achievement under its internal_key with the local unlock state looked up
+    // by name. In-memory only, so after a Steam start the first user reply
+    // usually beats it — see g_HeldUserAch.
+    std::unordered_map<AppId_t, std::vector<std::pair<uint32, std::string>>> g_GameAchSchema;
+
+    // appid -> account id (low 32 of the request steamid), captured on send so
+    // the recv handler knows which UserGameStats_<acct>_<app>.bin to read.
+    // Written on the send thread, read on recv: guarded by g_JobMutex.
+    std::unordered_map<AppId_t, AccountID_t> g_UserAchAccount;
+
+    // GetUserAchievements replies that arrived before their app's schema
+    // (SLS's choke-and-queue). We keep the real header+body, pass the client a
+    // copy aimed at a job nobody waits on (so it is dropped and the real job
+    // stays pending), then deliver the rebuilt reply once the schema lands.
+    // All of this runs on the RecvPkt thread, so no lock (the schema and group
+    // caches are recv-only too).
+    struct HeldUserAch {
+        AppId_t     appId;
+        std::string hdr;    // serialized CMsgProtoBufHeader, eresult already OK
+        std::string body;   // Valve's original CPlayer_GetUserAchievements_Response
+        std::chrono::steady_clock::time_point at;
+    };
+    std::vector<HeldUserAch>       g_HeldUserAch;
+    std::deque<std::vector<uint8>> g_UserAchPending;   // ready-to-deliver 147 frames
+
+    constexpr uint64 kDroppedJobId = 1;   // never allocated by CJobMgr
+    // Release a held reply as-is if its schema never shows, well before the
+    // client's job would time out.
+    constexpr auto kHoldTimeout = std::chrono::seconds(8);
 
     // ── Send: CPlayer_GetUserStats_Request (eMsg 151) ──────────
     bool HandleSend_GetUserStats(const uint8* pBody, uint32 cbBody,
                                  const uint8* pHdr, uint32 cbHdr)
     {
-
         CPlayer_GetUserStats_Request req;
         if (!req.ParseFromArray(pBody, cbBody)) {
             LOG_ACHIEVEMENT_WARN("Player::GetUserStats request: failed to ParseFromArray");
@@ -303,32 +356,64 @@ namespace Hooks_NetPacket_UserStats {
         }
 
         LOG_ACHIEVEMENT_DEBUG("Player::GetUserStats request: original body:\n{}", req.DebugString());
-        
+
         AppId_t appId = req.appid();
-        bool hasShaSchema = req.has_sha_schema() && !req.sha_schema().empty();
+        const bool isOnlineFix = (appId == Hooks_Misc::GetOnlineFixAppId() && Hooks_Misc::IsOnlineFixActive());
+        if (isOnlineFix) {
+            const AppId_t resolved = Hooks_Misc::ResolveAppId();
+            if (resolved != 0) {
+                appId = resolved;
+                req.set_appid(appId);
+            }
+        }
 
-        if (hasShaSchema) {
-            LOG_ACHIEVEMENT_WARN("Player::GetUserStats request: sha_schema is present, do not spoof");
+        // Truly owned games must pass through to official servers untouched
+        if (LuaConfig::IsOwned(appId)) {
             return false;
         }
-        if (!LuaConfig::HasDepot(appId)) {
-            LOG_ACHIEVEMENT_WARN("Player::GetUserStats request: appid={} is not in addappid", appId);
+
+        // Only manage apps that are in LuaConfig depot or CloudRedirect
+        if (!LuaConfig::HasDepot(appId) && !CloudRedirectHost::IsApp(appId)) {
+            LOG_ACHIEVEMENT_WARN("Player::GetUserStats request: appid={} is not managed", appId);
             return false;
         }
 
-        // Save jobid_source -> appid for the response handler
-        CMsgProtoBufHeader hdr;
-        if (hdr.ParseFromArray(pHdr, cbHdr) && hdr.has_jobid_source()) {
-            uint64 jobId = hdr.jobid_source();
-            g_JobIdToAppId[jobId] = appId;
-            LOG_ACHIEVEMENT_DEBUG("Player::GetUserStats request: stored jobid={} -> appid={}", jobId, appId);
+        const bool hasShaSchema = req.has_sha_schema() && !req.sha_schema().empty();
+        const std::string shaSchema = hasShaSchema ? req.sha_schema() : "";
+
+        // Save jobid_source -> PendingStatsJob for the response handler
+        if (pHdr && cbHdr > 0) {
+            CMsgProtoBufHeader hdr;
+            if (hdr.ParseFromArray(pHdr, cbHdr) && hdr.has_jobid_source()) {
+                uint64 jobId = hdr.jobid_source();
+                std::lock_guard<std::mutex> lock(g_JobMutex);
+                if (g_JobIdToPendingStats.size() >= 256) {
+                    g_JobIdToPendingStats.erase(g_JobIdToPendingStats.begin());
+                }
+                g_JobIdToPendingStats[jobId] = {appId, shaSchema};
+                LOG_ACHIEVEMENT_DEBUG("Player::GetUserStats request: stored jobid={} -> appid={}, sha_len={}",
+                    jobId, appId, shaSchema.size());
+            }
         }
 
+        // Spoof the stat SteamID even when the client already has a schema
+        // (sha_schema present), keeping the sha on the request: the server then
+        // returns a fresh schema only when its hash differs, so lua games pick
+        // up achievements added after their first download. If the server
+        // answers AccessDenied with an empty body instead, the response handler
+        // forces eresult=OK and restores this sha, so the client keeps using its
+        // cached schema exactly as when the request went out untouched.
+        if (hasShaSchema)
+            LOG_ACHIEVEMENT_DEBUG("Player::GetUserStats request: appid={} sha_schema present, spoofing anyway for schema refresh", appId);
+
+        // Borrow the donor steamid so Valve returns the schema for this app
         uint64_t newSteamId = LuaConfig::GetStatSteamId(appId);
-        req.set_steamid(newSteamId);
+        if (newSteamId != 0) {
+            req.set_steamid(newSteamId);
+        }
 
         g_cbSendNewBody = static_cast<uint32>(req.ByteSizeLong());
-        if (!req.SerializeToArray(g_SendNewBody, kMaxBodySize)) {
+        if (g_cbSendNewBody > kMaxBodySize || !req.SerializeToArray(g_SendNewBody, kMaxBodySize)) {
             LOG_ACHIEVEMENT_WARN("Player::GetUserStats request: failed to encode");
             return false;
         }
@@ -338,61 +423,148 @@ namespace Hooks_NetPacket_UserStats {
     }
 
     // ── Recv: CPlayer_GetUserStats_Response (eMsg 147) ─────────
-    //     Header: set eresult=OK.  Body: strip stats (field 4).
+    //     Header: set eresult=OK. Body: strip donor stats, overlay CR achievements.
     void HandleRecv_GetUserStatsResponse(const uint8* pHdr, uint32 cbHdr,
-                                    const uint8* pBody, uint32 cbBody)
+                                         const uint8* pBody, uint32 cbBody)
     {
-        // Header: set eresult=OK
+        if (!pHdr || cbHdr == 0) return;
         CMsgProtoBufHeader hdrMsg;
-        if (!hdrMsg.ParseFromArray(pHdr, cbHdr)){
+        if (!hdrMsg.ParseFromArray(pHdr, cbHdr)) {
             LOG_ACHIEVEMENT_WARN("Player::GetUserStats response: failed to ParseFromArray original header");
             return;
         }
         LOG_ACHIEVEMENT_DEBUG("Player::GetUserStats response: original header:\n{}", hdrMsg.DebugString());
+        if (hdrMsg.steamid() != 0)
+            AchSchema::SetLocalAccountId(hdrMsg.steamid());
 
-        // Look up appid via jobid_target -> jobid_source match
-        AppId_t appId = 0;
-        bool hasAppId = false;
+        // Look up pending stats info via jobid_target -> jobid_source match
+        PendingStatsJob pending;
+        bool hasPending = false;
         if (hdrMsg.has_jobid_target()) {
             uint64 jobId = hdrMsg.jobid_target();
-            auto it = g_JobIdToAppId.find(jobId);
-            if (it != g_JobIdToAppId.end()) {
-                appId = it->second;
-                hasAppId = true;
-                LOG_ACHIEVEMENT_DEBUG("Player::GetUserStats response: matched jobid={} -> appid={}", jobId, appId);
-                g_JobIdToAppId.erase(it);
+            std::lock_guard<std::mutex> lock(g_JobMutex);
+            auto it = g_JobIdToPendingStats.find(jobId);
+            if (it != g_JobIdToPendingStats.end()) {
+                pending = it->second;
+                hasPending = true;
+                LOG_ACHIEVEMENT_DEBUG("Player::GetUserStats response: matched jobid={} -> appid={}", jobId, pending.appId);
+                g_JobIdToPendingStats.erase(it);
             }
         }
 
-        hdrMsg.set_eresult(static_cast<int32_t>(k_EResultOK));
-        g_cbNewHdr = static_cast<uint32>(hdrMsg.ByteSizeLong());
-        if (g_cbNewHdr > kMaxHdrSize || !hdrMsg.SerializeToArray(g_NewHdr, kMaxHdrSize))
+        // Owned games and unmanaged games (e.g. family sharing without Lua) keep their body
+        if (!hasPending || LuaConfig::IsOwned(pending.appId) ||
+            (!LuaConfig::HasDepot(pending.appId) && !CloudRedirectHost::IsApp(pending.appId))) {
+            hdrMsg.set_eresult(static_cast<int32_t>(k_EResultOK));
+            if (hdrMsg.has_error_message()) {
+                hdrMsg.clear_error_message();
+            }
+            uint32 cbHdrNew = static_cast<uint32>(hdrMsg.ByteSizeLong());
+            if (cbHdrNew > kMaxHdrSize || !hdrMsg.SerializeToArray(g_NewHdr, kMaxHdrSize))
+                return;
+            g_cbNewHdr = cbHdrNew;
+            g_NeedReplaceHdr = true;
+            LOG_ACHIEVEMENT_DEBUG("Player::GetUserStats response: unmanaged appid {} (or no match), header forced OK, body untouched", pending.appId);
             return;
-        LOG_ACHIEVEMENT_DEBUG("Player::GetUserStats response: modified header:\n{}", hdrMsg.DebugString());
-        g_NeedReplaceHdr = true;
+        }
 
-        // Body: strip stats (only if appid was matched and is in our config)
+        const AppId_t appId = pending.appId;
+
         CPlayer_GetUserStats_Response resp;
-        if (!resp.ParseFromArray(pBody, cbBody)){
-            LOG_ACHIEVEMENT_WARN("Player::GetUserStats response: failed to ParseFromArray original response");
-            return;
+        if (pBody && cbBody > 0) {
+            if (!resp.ParseFromArray(pBody, cbBody)) {
+                LOG_ACHIEVEMENT_WARN("Player::GetUserStats response: failed to ParseFromArray original response");
+                resp.Clear();
+            }
         }
         LOG_ACHIEVEMENT_DEBUG("Player::GetUserStats response: original body:\n{}", resp.DebugString());
 
-        if (!hasAppId || !LuaConfig::HasDepot(appId)) {
-            LOG_ACHIEVEMENT_DEBUG("Player::GetUserStats response: no appid match, skip body strip");
-            return;
+        // Protect sha_schema: if Valve's response lacks sha_schema (e.g. AccessDenied empty body),
+        // restore the sha_schema that the client originally requested so local schema cache remains active!
+        if ((!resp.has_sha_schema() || resp.sha_schema().empty()) && !pending.shaSchema.empty()) {
+            resp.set_sha_schema(pending.shaSchema);
+            LOG_ACHIEVEMENT_DEBUG("Player::GetUserStats response: restored sha_schema (len={}) for app {}",
+                pending.shaSchema.size(), appId);
         }
 
         resp.clear_stats();
-        g_NewBodySize = static_cast<uint32>(resp.ByteSizeLong());
-        if (!resp.SerializeToArray(const_cast<uint8*>(pBody), cbBody)){
+
+        // Inject CloudRedirect achievements
+        CloudRedirectHost::AchievementBlock blocks[64]{};
+        uint32_t n = CloudRedirectHost::GetAchievements(appId, blocks, 64);
+        if (n > 0) {
+            uint32_t crc = 0;
+            for (uint32_t i = 0; i < n; i++) {
+                auto* s = resp.add_stats();
+                s->set_stat_id(blocks[i].statId);
+                s->set_stat_value(blocks[i].bits);
+                for (uint32_t bit = 0; bit < 32; bit++) {
+                    if ((blocks[i].bits & (1u << bit)) != 0) {
+                        auto* ut = s->add_unlock_times();
+                        ut->set_achievement_bit(bit);
+                        ut->set_unlock_time(blocks[i].unlockTimes[bit]);
+                    }
+                }
+                crc ^= blocks[i].bits ^ blocks[i].statId;
+            }
+            resp.set_crc_stats(crc);
+            LOG_ACHIEVEMENT_DEBUG("Player::GetUserStats response: injected {} CR achievement blocks for app {}", n, appId);
+        } else {
+            // An explicit crc marks the record changed even with no unlocks, so the
+            // client persists schema and stats on its next cache flush.
+            resp.set_crc_stats(0);
+            LOG_ACHIEVEMENT_DEBUG("Player::GetUserStats response: cleared stats (no CR achievements for app {})", appId);
+        }
+
+        // Transactional serialization: only commit both if both succeed
+        hdrMsg.set_eresult(static_cast<int32_t>(k_EResultOK));
+        if (hdrMsg.has_error_message()) {
+            hdrMsg.clear_error_message();
+        }
+
+        // First fetch (client sent no sha): donor was denied, so serve a synthesized
+        // schema so the client can persist UserGameStatsSchema and list achievements.
+        // When the client already sent a sha it has a schema of its own — never
+        // replace that with a synthesized one (the sha restore above covers it).
+        // When the schema already sits in appcache\stats, stand down: an empty
+        // response makes the client use its own disk-load fallback, which is the
+        // path the Steam client and tools like SLSah rely on.
+        if (resp.schema().empty() && pending.shaSchema.empty()) {
+            if (AchSchema::SteamStatsFileExists(appId)) {
+                LOG_ACHIEVEMENT_DEBUG("Player::GetUserStats response: schema on disk for app {}, deferring to client disk load", appId);
+            } else {
+                std::string synth = AchSchema::GetCached(appId);
+                if (synth.empty()) {
+                    AchSchema::RequestSynth(appId);
+                    synth = AchSchema::GetCachedAwait(appId, std::chrono::milliseconds(6000));
+                }
+                if (synth.empty()) {
+                    LOG_ACHIEVEMENT_DEBUG("Player::GetUserStats response: no schema for app {}, synthesis requested", appId);
+                } else {
+                    resp.set_schema(synth);
+                    resp.set_sha_schema(OSTPlatform::Hash::Sha1RawOfBuffer(synth.data(), synth.size()));
+                    AchSchema::EnsureSteamStatsFiles(appId, synth);
+                    LOG_ACHIEVEMENT_DEBUG("Player::GetUserStats response: injected synthetic schema ({} bytes) for app {}",
+                                          synth.size(), appId);
+                }
+            }
+        }
+
+        uint32 cbHdrNew = static_cast<uint32>(hdrMsg.ByteSizeLong());
+        if (cbHdrNew > kMaxHdrSize || !hdrMsg.SerializeToArray(g_NewHdr, kMaxHdrSize))
+            return;
+
+        uint32 cbBodyNew = static_cast<uint32>(resp.ByteSizeLong());
+        if (cbBodyNew > kMaxBodySize || !resp.SerializeToArray(g_NewBody, kMaxBodySize)) {
             LOG_ACHIEVEMENT_WARN("Player::GetUserStats response: failed to SerializeToArray modified response");
             return;
         }
-        g_ResizedInPlace = true;
 
-        LOG_ACHIEVEMENT_DEBUG("Player::GetUserStats response: modified body:\n{}", resp.DebugString());
+        g_cbNewHdr = cbHdrNew;
+        g_NeedReplaceHdr = true;
+        g_cbNewBody = cbBodyNew;
+        g_NeedReplaceBody = true;
+        LOG_ACHIEVEMENT_DEBUG("Player::GetUserStats response: successfully committed modified header and body");
     }
 
     // ── Send: CMsgClientGetUserStats (eMsg 818) ────────────────
@@ -410,8 +582,18 @@ namespace Hooks_NetPacket_UserStats {
             return false;
         }
         AppId_t appId = static_cast<AppId_t>(req.game_id());
-        if (!LuaConfig::HasDepot(appId)) {
-            LOG_ACHIEVEMENT_WARN("ClientGetUserStats request: appid={} is not in addappid", appId);
+        if (appId == Hooks_Misc::GetOnlineFixAppId() && Hooks_Misc::IsOnlineFixActive()) {
+            const AppId_t resolved = Hooks_Misc::ResolveAppId();
+            if (resolved != 0) {
+                appId = resolved;
+                req.set_game_id(appId);
+            }
+        }
+        if (LuaConfig::IsOwned(appId)) {
+            return false;
+        }
+        if (!LuaConfig::HasDepot(appId) && !CloudRedirectHost::IsApp(appId)) {
+            LOG_ACHIEVEMENT_WARN("ClientGetUserStats request: appid={} is not managed", appId);
             return false;
         }
         if (req.schema_local_version() != -1) {
@@ -420,10 +602,12 @@ namespace Hooks_NetPacket_UserStats {
         }
 
         uint64_t newSteamId = LuaConfig::GetStatSteamId(appId);
-        req.set_steam_id_for_user(newSteamId);
+        if (newSteamId != 0) {
+            req.set_steam_id_for_user(newSteamId);
+        }
 
         g_cbSendNewBody = static_cast<uint32>(req.ByteSizeLong());
-        if (!req.SerializeToArray(g_SendNewBody, kMaxBodySize)) {
+        if (g_cbSendNewBody > kMaxBodySize || !req.SerializeToArray(g_SendNewBody, kMaxBodySize)) {
             LOG_ACHIEVEMENT_WARN("ClientGetUserStats request: failed to SerializeToArray");
             return false;
         }
@@ -436,21 +620,37 @@ namespace Hooks_NetPacket_UserStats {
     //     Clear donor stats, overlay CR achievements, patch eresult->OK.
     bool HandleRecv_ClientGetUserStatsResponse(const uint8* pBody, uint32 cbBody)
     {
+        if (!pBody || cbBody == 0)
+            return false;
         CMsgClientGetUserStatsResponse resp;
         if (!resp.ParseFromArray(pBody, cbBody))
             return false;
         LOG_ACHIEVEMENT_DEBUG("ClientGetUserStats response: original body:\n{}", resp.DebugString());
-        if(!resp.has_game_id() || !LuaConfig::HasDepot(static_cast<AppId_t>(resp.game_id()))) {
-            LOG_ACHIEVEMENT_DEBUG("ClientGetUserStats response: no modification needed");
+        if (!resp.has_game_id()) {
             return false;
         }
+
+        AppId_t appId = static_cast<AppId_t>(resp.game_id());
+        if (appId == Hooks_Misc::GetOnlineFixAppId() && Hooks_Misc::IsOnlineFixActive()) {
+            const AppId_t resolved = Hooks_Misc::ResolveAppId();
+            if (resolved != 0) {
+                appId = resolved;
+            }
+        }
+        if (LuaConfig::IsOwned(appId)) {
+            return false;
+        }
+        if (!LuaConfig::HasDepot(appId) && !CloudRedirectHost::IsApp(appId)) {
+            LOG_ACHIEVEMENT_DEBUG("ClientGetUserStats response: appid={} not managed, skip", appId);
+            return false;
+        }
+
         resp.clear_stats();
         resp.clear_achievement_blocks();
         resp.set_eresult(1);  // k_EResultOK
 
         // Overlay CR's cloud-synced achievement state
-        const auto appId = static_cast<uint32_t>(resp.game_id());
-        CloudRedirectHost::AchievementBlock blocks[64];
+        CloudRedirectHost::AchievementBlock blocks[64]{};
         uint32_t n = CloudRedirectHost::GetAchievements(appId, blocks, 64);
         if (n > 0) {
             uint32_t crc = 0;
@@ -479,9 +679,318 @@ namespace Hooks_NetPacket_UserStats {
             return false;
 
         g_cbNewBody = static_cast<uint32>(newSize);
-        g_NeedReplaceBody = true;
         LOG_ACHIEVEMENT_DEBUG("ClientGetUserStats response: modified body:\n{}", resp.DebugString());
         return true;
+    }
+
+    // ── Recv: CMsgClientStoreUserStatsResponse (eMsg 821) ────────
+    void HandleRecv_ClientStoreUserStatsResponse(const uint8* pHdr, uint32 cbHdr,
+                                                 const uint8* pBody, uint32 cbBody)
+    {
+        if (!pBody || cbBody == 0)
+            return;
+        CMsgClientStoreUserStatsResponse resp;
+        if (!resp.ParseFromArray(pBody, cbBody))
+            return;
+        LOG_ACHIEVEMENT_DEBUG("ClientStoreUserStats response: original body:\n{}", resp.DebugString());
+        if (!resp.has_game_id())
+            return;
+
+        AppId_t appId = static_cast<AppId_t>(resp.game_id());
+        if (appId == Hooks_Misc::GetOnlineFixAppId() && Hooks_Misc::IsOnlineFixActive()) {
+            const AppId_t resolved = Hooks_Misc::ResolveAppId();
+            if (resolved != 0) {
+                appId = resolved;
+            }
+        }
+        if (LuaConfig::IsOwned(appId)) {
+            return;
+        }
+        if (!LuaConfig::HasDepot(appId) && !CloudRedirectHost::IsApp(appId)) {
+            return;
+        }
+
+        // If header has non-OK eresult, patch header to OK
+        if (pHdr && cbHdr > 0) {
+            CMsgProtoBufHeader hdrMsg;
+            if (hdrMsg.ParseFromArray(pHdr, cbHdr) && hdrMsg.has_eresult() && hdrMsg.eresult() != 1) {
+                hdrMsg.set_eresult(1);
+                if (hdrMsg.has_error_message()) {
+                    hdrMsg.clear_error_message();
+                }
+                uint32 cb = static_cast<uint32>(hdrMsg.ByteSizeLong());
+                if (cb <= kMaxHdrSize && hdrMsg.SerializeToArray(g_NewHdr, kMaxHdrSize)) {
+                    g_cbNewHdr = cb;
+                    g_NeedReplaceHdr = true;
+                    LOG_ACHIEVEMENT_DEBUG("ClientStoreUserStats response: patched header eresult to OK for app {}", appId);
+                }
+            }
+        }
+
+        bool bodyChanged = false;
+        if (resp.eresult() != 1) { // 1 = k_EResultOK
+            resp.set_eresult(1);
+            bodyChanged = true;
+        }
+        if (resp.has_stats_failed_validation()) {
+            resp.clear_stats_failed_validation();
+            bodyChanged = true;
+        }
+        if (bodyChanged) {
+            auto newSize = resp.ByteSizeLong();
+            if (newSize <= sizeof(g_NewBody) && resp.SerializeToArray(g_NewBody, sizeof(g_NewBody))) {
+                g_cbNewBody = static_cast<uint32>(newSize);
+                g_NeedReplaceBody = true;
+                LOG_ACHIEVEMENT_DEBUG("ClientStoreUserStats response: patched body eresult to OK for app {}", appId);
+            }
+        }
+    }
+
+
+    // ══ New "groups" achievement path ══════════════════════════
+    //  Player.GetGameAchievements#1  (schema: groups + internal_key/name)
+    //  Player.GetUserAchievements#1  (per-user unlock state; blank for unowned)
+    // The client UI reads unlock state from the user reply, not local stats, so
+    // for lua games we rebuild it SLS-style: every schema achievement under its
+    // internal_key with unlock/progress from the local .bin (LocalAchievements),
+    // and every group achievable.
+
+    // Fill resp from the cached schema + local stats. Mirrors SLS field-for-field:
+    // unlocked/unlock_time only when unlocked, progress_float always (the UI
+    // reads it; leaving it unset blanks the page). False if no schema cached.
+    bool FillUserAchievements(AppId_t appId, CPlayer_GetUserAchievements_Response& resp,
+                              size_t& nUnlocked)
+    {
+        auto si = g_GameAchSchema.find(appId);
+        if (si == g_GameAchSchema.end()) return false;
+
+        AccountID_t acct = 0;
+        {
+            std::lock_guard<std::mutex> lock(g_JobMutex);
+            if (auto ai = g_UserAchAccount.find(appId); ai != g_UserAchAccount.end())
+                acct = ai->second;
+        }
+        const auto local = LocalAchievements::Read(appId, acct);
+
+        resp.clear_achievements();
+        resp.clear_groups();
+        nUnlocked = 0;
+        for (const auto& [key, name] : si->second) {
+            auto* a = resp.add_achievements();
+            a->set_internal_key(key);
+            auto li = local.find(name);
+            const bool found = li != local.end();
+            if (found && li->second.unlocked) {
+                a->set_unlocked(true);
+                a->set_unlock_time(li->second.unlockTime);
+                ++nUnlocked;
+            }
+            a->set_progress_float(found ? li->second.progress : 0.0f);
+        }
+        if (auto gi = g_GameAchGroups.find(appId); gi != g_GameAchGroups.end()) {
+            for (uint32 gid : gi->second) {
+                auto* g = resp.add_groups();
+                g->set_groupid(gid);
+                g->set_is_achievable(true);
+            }
+        }
+        return true;
+    }
+
+    // Rebuild a held reply (or pass Valve's as-is if there's still no schema)
+    // and queue it as a full 147 frame for DrainAchievements.
+    void QueueHeldUserAch(const HeldUserAch& h)
+    {
+        CPlayer_GetUserAchievements_Response resp;
+        resp.ParseFromString(h.body);
+        size_t nUnlocked = 0;
+        const bool filled = FillUserAchievements(h.appId, resp, nUnlocked);
+        const std::string body = resp.SerializeAsString();
+
+        const uint32 cbHdr = static_cast<uint32>(h.hdr.size());
+        const uint32 cbBody = static_cast<uint32>(body.size());
+        const uint32 total = sizeof(MsgHdr) + cbHdr + cbBody;
+        if (cbHdr > kMaxHdrSize || cbBody > kMaxBodySize || total > kMaxPacketSize) {
+            LOG_ACHIEVEMENT_WARN("GetUserAchievements: app={} rebuilt reply too large ({} bytes), dropped",
+                                 h.appId, total);
+            return;
+        }
+        std::vector<uint8> pkt(total);
+        auto* mhdr = reinterpret_cast<MsgHdr*>(pkt.data());
+        mhdr->eMsg = static_cast<EMsg>(
+            static_cast<uint32>(k_EMsgServiceMethodResponse) | kMsgHdrProtoFlag);
+        mhdr->headerLength = cbHdr;
+        memcpy(pkt.data() + sizeof(MsgHdr), h.hdr.data(), cbHdr);
+        memcpy(pkt.data() + sizeof(MsgHdr) + cbHdr, body.data(), cbBody);
+        g_UserAchPending.push_back(std::move(pkt));
+
+        if (filled)
+            LOG_ACHIEVEMENT_INFO("GetUserAchievements: app={} queued held reply, {}/{} achievements unlocked",
+                                 h.appId, nUnlocked, resp.achievements_size());
+        else
+            LOG_ACHIEVEMENT_WARN("GetUserAchievements: app={} schema never arrived, released reply as-is",
+                                 h.appId);
+    }
+
+    // ── Send: map jobid_source -> appid (lua games only) ──
+    void HandleSend_GetGameAchievements(const uint8* pBody, uint32 cbBody,
+                                        const uint8* pHdr, uint32 cbHdr)
+    {
+        CPlayer_GetGameAchievements_Request req;
+        if (!req.ParseFromArray(pBody, cbBody) || !req.has_appid()) return;
+        const AppId_t appId = req.appid();
+        if (!LuaConfig::HasDepot(appId)) return;
+        CMsgProtoBufHeader hdr;
+        if (hdr.ParseFromArray(pHdr, cbHdr) && hdr.has_jobid_source()) {
+            std::lock_guard<std::mutex> lock(g_JobMutex);
+            g_JobIdToAppId[hdr.jobid_source()] = appId;
+            LOG_ACHIEVEMENT_DEBUG("GetGameAchievements send: jobid={} -> appid={}", hdr.jobid_source(), appId);
+        }
+    }
+
+    void HandleSend_GetUserAchievements(const uint8* pBody, uint32 cbBody,
+                                        const uint8* pHdr, uint32 cbHdr)
+    {
+        CPlayer_GetUserAchievements_Request req;
+        if (!req.ParseFromArray(pBody, cbBody) || !req.has_appid()) return;
+        const AppId_t appId = req.appid();
+        if (!LuaConfig::HasDepot(appId)) return;
+        if (req.has_steamid()) {
+            std::lock_guard<std::mutex> lock(g_JobMutex);
+            g_UserAchAccount[appId] = static_cast<AccountID_t>(req.steamid() & 0xFFFFFFFFull);
+        }
+        CMsgProtoBufHeader hdr;
+        if (hdr.ParseFromArray(pHdr, cbHdr) && hdr.has_jobid_source()) {
+            std::lock_guard<std::mutex> lock(g_JobMutex);
+            g_JobIdToAppId[hdr.jobid_source()] = appId;
+            LOG_ACHIEVEMENT_DEBUG("GetUserAchievements send: jobid={} -> appid={}", hdr.jobid_source(), appId);
+        }
+    }
+
+    // ── Recv: GetGameAchievements response -> capture group ids, pass through ──
+    void HandleRecv_GetGameAchievementsResponse(const uint8* pHdr, uint32 cbHdr,
+                                                const uint8* pBody, uint32 cbBody)
+    {
+        CMsgProtoBufHeader hdr;
+        if (!hdr.ParseFromArray(pHdr, cbHdr) || !hdr.has_jobid_target()) return;
+        AppId_t appId = 0;
+        {
+            std::lock_guard<std::mutex> lock(g_JobMutex);
+            auto it = g_JobIdToAppId.find(hdr.jobid_target());
+            if (it == g_JobIdToAppId.end()) return;
+            appId = it->second;
+            g_JobIdToAppId.erase(it);
+        }
+
+        CPlayer_GetGameAchievements_Response resp;
+        if (!resp.ParseFromArray(pBody, cbBody)) return;
+        std::vector<uint32> groups;
+        groups.reserve(static_cast<size_t>(resp.groups_size()));
+        for (const auto& g : resp.groups())
+            if (g.has_groupid()) groups.push_back(g.groupid());
+
+        // Capture (internal_key, internal_name) so the user reply can emit each
+        // achievement under its key with unlock state resolved by name.
+        std::vector<std::pair<uint32, std::string>> schema;
+        schema.reserve(static_cast<size_t>(resp.achievements_size()));
+        for (const auto& a : resp.achievements())
+            if (a.has_internal_key() && a.has_internal_name())
+                schema.emplace_back(a.internal_key(), a.internal_name());
+
+        // A hash_only reply carries no achievements; don't let it wipe a good cache.
+        if (schema.empty() && g_GameAchSchema.count(appId)) {
+            LOG_ACHIEVEMENT_DEBUG("GetGameAchievements recv: app={} empty reply, keeping cached schema", appId);
+        } else {
+            LOG_ACHIEVEMENT_DEBUG("GetGameAchievements recv: app={} stored {} group(s), {} achievement(s)",
+                                  appId, groups.size(), schema.size());
+            g_GameAchGroups[appId] = std::move(groups);
+            g_GameAchSchema[appId] = std::move(schema);
+        }
+
+        // Release any user replies that were waiting on this schema.
+        for (auto h = g_HeldUserAch.begin(); h != g_HeldUserAch.end();) {
+            if (h->appId == appId) { QueueHeldUserAch(*h); h = g_HeldUserAch.erase(h); }
+            else ++h;
+        }
+        // Pass through: Valve's public schema is correct.
+    }
+
+    // ── Recv: GetUserAchievements response -> rebuilt from schema + local stats ──
+    void HandleRecv_GetUserAchievementsResponse(const uint8* pHdr, uint32 cbHdr,
+                                                const uint8* pBody, uint32 cbBody)
+    {
+        CMsgProtoBufHeader hdr;
+        if (!hdr.ParseFromArray(pHdr, cbHdr) || !hdr.has_jobid_target()) return;
+        AppId_t appId = 0;
+        {
+            std::lock_guard<std::mutex> lock(g_JobMutex);
+            auto it = g_JobIdToAppId.find(hdr.jobid_target());
+            if (it == g_JobIdToAppId.end()) return;
+            appId = it->second;
+            g_JobIdToAppId.erase(it);
+        }
+        if (!LuaConfig::HasDepot(appId)) return;
+
+        // Header: force eresult OK so the client doesn't treat the game as denied.
+        hdr.set_eresult(static_cast<int32_t>(k_EResultOK));
+
+        CPlayer_GetUserAchievements_Response resp;
+        if (!resp.ParseFromArray(pBody, cbBody)) return;
+
+        size_t nUnlocked = 0;
+        if (!FillUserAchievements(appId, resp, nUnlocked)) {
+            // Beat its schema (normal on the first page open after a Steam
+            // start). Hold the real reply; aim this copy at a dead job so the
+            // client drops it while the real job keeps waiting.
+            g_HeldUserAch.push_back({ appId, hdr.SerializeAsString(),
+                                      std::string(reinterpret_cast<const char*>(pBody), cbBody),
+                                      std::chrono::steady_clock::now() });
+            hdr.set_jobid_target(kDroppedJobId);
+            g_cbNewHdr = static_cast<uint32>(hdr.ByteSizeLong());
+            if (g_cbNewHdr > kMaxHdrSize || !hdr.SerializeToArray(g_NewHdr, kMaxHdrSize)) {
+                g_HeldUserAch.pop_back();   // can't choke it; let it through untouched
+                return;
+            }
+            g_NeedReplaceHdr = true;
+            LOG_ACHIEVEMENT_INFO("GetUserAchievements recv: app={} arrived before schema, held", appId);
+            return;
+        }
+
+        g_cbNewHdr = static_cast<uint32>(hdr.ByteSizeLong());
+        if (g_cbNewHdr > kMaxHdrSize || !hdr.SerializeToArray(g_NewHdr, kMaxHdrSize)) return;
+        g_NeedReplaceHdr = true;
+        g_cbNewBody = static_cast<uint32>(resp.ByteSizeLong());
+        if (g_cbNewBody > kMaxBodySize || !resp.SerializeToArray(g_NewBody, kMaxBodySize)) return;
+        g_NeedReplaceBody = true;
+        LOG_ACHIEVEMENT_INFO("GetUserAchievements recv: app={} eresult=OK, {} group(s), {}/{} achievements unlocked",
+                             appId, resp.groups_size(), nUnlocked, resp.achievements_size());
+    }
+
+    // Deliver queued rebuilt replies by borrowing the carrier packet for one
+    // oRecvPkt call each (same trick as Cloud::Drain), after first releasing
+    // any held reply whose schema never showed.
+    void DrainAchievements(void* pThis, CNetPacket* pCarrier,
+                           bool (*invokeOriginal)(void*, CNetPacket*))
+    {
+        const auto now = std::chrono::steady_clock::now();
+        for (auto h = g_HeldUserAch.begin(); h != g_HeldUserAch.end();) {
+            if (now - h->at >= kHoldTimeout) { QueueHeldUserAch(*h); h = g_HeldUserAch.erase(h); }
+            else ++h;
+        }
+
+        while (!g_UserAchPending.empty()) {
+            std::vector<uint8> pkt = std::move(g_UserAchPending.front());
+            g_UserAchPending.pop_front();
+
+            uint8* origData = PktData(pCarrier);
+            uint32 origSize = PktSize(pCarrier);
+            SetPktData(pCarrier, pkt.data());
+            SetPktSize(pCarrier, static_cast<uint32>(pkt.size()));
+            invokeOriginal(pThis, pCarrier);
+            SetPktData(pCarrier, origData);
+            SetPktSize(pCarrier, origSize);
+            LOG_ACHIEVEMENT_DEBUG("GetUserAchievements: delivered {}-byte held reply", pkt.size());
+        }
     }
 
 } // namespace Hooks_NetPacket_UserStats
@@ -541,38 +1050,47 @@ namespace Hooks_NetPacket_ETicket {
 // ════════════════════════════════════════════════════════════════
 namespace Hooks_NetPacket_FamilySharing {
 
-    void ClearBody(const uint8*, uint32);
+    // 家庭共享的进出方向一概不干预，交给 Steam 按原生规则处理。
+    // 曾经在这里抹掉出借方归属、清空运行列表、丢弃锁库与停玩通知，试图让
+    // 借用方不受共享名额限制。实测那套做法改不动服务器的账：服务器按自己
+    // 记录的许可与占用判定，客户端说什么它都不采信，一轮倒计时走完照样踢线，
+    // 反而因为上报数据和它的账对不上，把原本的软提醒升级成了断开会话。
+    // 现在只保留观测，不改任何内容：占用名额、到期收回都是共享本来的行为。
 
-    // NotifyRunningApps 消毒：保留合法的 family_groupid，只清空 running_apps。
-    // 客户端收到结构合法的"0 个游戏在运行"通知，主动清除库锁定状态。
-    void HandleRecv_NotifyRunningApps(const uint8* pBody, uint32 cbBody)
+    // 停玩通知里写着要停哪个 AppId、归属给谁、还剩多少秒，落盘便于排查。
+    void LogStopPlaying(const uint8* pBody, uint32 cbBody)
     {
-        CFamilyGroupsClient_NotifyRunningApps_Notification notify;
-        if (notify.ParseFromArray(pBody, cbBody)) {
-            const int runningCount = notify.running_apps_size();
-            notify.clear_running_apps();
-
-            const auto encSize = notify.ByteSizeLong();
-            if (encSize <= sizeof(g_NewBody) && notify.SerializeToArray(g_NewBody, static_cast<int>(sizeof(g_NewBody)))) {
-                g_cbNewBody = static_cast<uint32>(encSize);
-                g_NeedReplaceBody = true;
-                LOG_NETPACKET_INFO("FamilySharing: Sanitized NotifyRunningApps (family_groupid {}, cleared {} running apps)",
-                                   notify.family_groupid(), runningCount);
-                return;
-            }
+        CMsgClientSharedLibraryStopPlaying msg;
+        if (!msg.ParseFromArray(pBody, cbBody)) {
+            LOG_NETPACKET_WARN("FamilySharing: StopPlaying body unparsable ({} bytes)", cbBody);
+            return;
         }
 
-        // 解析失败时回退为丢弃整包
-        ClearBody(pBody, cbBody);
-        LOG_NETPACKET_DEBUG("FamilySharing: Cleared NotifyRunningApps body (fallback)");
+        // 正常一次只有一两条，这里仍然设上限：包由服务端给出，
+        // 万一内容异常也不该让日志字符串无界膨胀。
+        constexpr int kMaxLogged = 8;
+        std::string detail;
+        for (int i = 0; i < msg.stop_apps_size() && i < kMaxLogged; ++i) {
+            const auto& app = msg.stop_apps(i);
+            if (!detail.empty()) detail += ", ";
+            detail += std::format("app_id={} owner_id={}",
+                                  app.has_app_id() ? app.app_id() : 0,
+                                  app.has_owner_id() ? app.owner_id() : 0);
+        }
+        if (msg.stop_apps_size() > kMaxLogged) {
+            detail += std::format(", ...(+{})", msg.stop_apps_size() - kMaxLogged);
+        }
+        LOG_NETPACKET_INFO("FamilySharing: StopPlaying seconds_left={} stop_apps=[{}]",
+                           msg.has_seconds_left() ? msg.seconds_left() : -1, detail);
     }
 
-    // 丢弃入方向锁库/停玩通知，压制踢人计时
-    void ClearBody(const uint8*, uint32)
+    // 运行列表只记录不修改，用于确认服务器对占用名额的判定。
+    void LogRunningApps(const uint8* pBody, uint32 cbBody)
     {
-        LOG_NETPACKET_DEBUG("FamilySharing: Clearing incoming family sharing lock/stop notification...");
-        g_cbNewBody = 0;
-        g_NeedReplaceBody = true;
+        CFamilyGroupsClient_NotifyRunningApps_Notification notify;
+        if (!notify.ParseFromArray(pBody, cbBody)) return;
+        LOG_NETPACKET_DEBUG("FamilySharing: NotifyRunningApps (family_groupid {}, {} running apps)",
+                            notify.family_groupid(), notify.running_apps_size());
     }
 
 } // namespace Hooks_NetPacket_FamilySharing
@@ -710,8 +1228,9 @@ namespace Hooks_NetPacket_Manifest {
 // ════════════════════════════════════════════════════════════════
 namespace Hooks_NetPacket_RichPresence {
 
-    AppId_t g_PlayingAppId = 0;
-    uint64  g_LocalSteamId = 0;
+    std::mutex           g_RPMutex;
+    std::atomic<AppId_t> g_PlayingAppId{0};
+    std::atomic<uint64>  g_LocalSteamId{0};
 
     // Most recent self-PersonaState bytes captured from a real server push.
     // Reused as the template every game launch.
@@ -871,20 +1390,23 @@ namespace Hooks_NetPacket_RichPresence {
         ExtractStringKVs(reinterpret_cast<const uint8*>(kv.data()),
                          static_cast<uint32>(kv.size()), kvs);
         LOG_RICHPRESENCE_DEBUG("RP upload appid={}: kv_bytes={} extracted={} pairs",
-            g_PlayingAppId, kv.size(), kvs.size());
+            g_PlayingAppId.load(std::memory_order_relaxed), kv.size(), kvs.size());
 
         if (BroadcastEnabled() && BuildInject(g_PlayingAppId)) g_InjectPending = true;
     }
 
     void TrackSend(const CMsgClientGamesPlayed& msg, const uint8* pHdr, uint32 cbHdr)
     {
-        if (g_LocalSteamId == 0) {
-            CMsgProtoBufHeader hdr;
-            if (hdr.ParseFromArray(pHdr, cbHdr) && hdr.has_steamid() && hdr.steamid()) {
-                g_LocalSteamId = hdr.steamid();
-                LOG_RICHPRESENCE_DEBUG("Captured local SteamID 0x{:X}", g_LocalSteamId);
-                CloudRedirectHost::SetAccountId(
-                    static_cast<uint32_t>(g_LocalSteamId & 0xFFFFFFFF));
+        uint64 localSteamId = 0;
+        {
+            std::lock_guard lock(g_RPMutex);
+            if (g_LocalSteamId == 0) {
+                CMsgProtoBufHeader hdr;
+                if (hdr.ParseFromArray(pHdr, cbHdr) && hdr.has_steamid() && hdr.steamid()) {
+                    g_LocalSteamId = hdr.steamid();
+                    localSteamId = g_LocalSteamId;
+                    LOG_RICHPRESENCE_DEBUG("Captured local SteamID 0x{:X}", localSteamId);
+                }
             }
         }
 
@@ -901,7 +1423,7 @@ namespace Hooks_NetPacket_RichPresence {
         // Owned games on top let the server's natural broadcast paint the
         // cache; -onlinefix games are already handled by the OnlineFix path.
         AppId_t newTracked = 0;
-        if (topmost != 0 && topmost != kOnlineFixAppId && LuaConfig::HasDepot(topmost))
+        if (topmost != 0 && topmost != Hooks_Misc::GetOnlineFixAppId() && LuaConfig::HasDepot(topmost))
             newTracked = topmost;
 
         if (g_PlayingAppId == newTracked) return;
@@ -919,6 +1441,7 @@ namespace Hooks_NetPacket_RichPresence {
 
         if (newTracked != 0) {
             LOG_RICHPRESENCE_INFO("Tracking topmost appid {}", newTracked);
+            LuaConfig::PrewarmStatSteamId(newTracked);
             if (BuildInject(newTracked)) g_InjectPending = true;
         } else if (topmost == 0) {
             // Stack went empty — inject a clear so the cache reverts.
@@ -978,7 +1501,8 @@ namespace Hooks_NetPacket_RichPresence {
             LOG_RICHPRESENCE_WARN("In-place patch SerializeToArray failed");
             return false;
         }
-        LOG_RICHPRESENCE_INFO("Patched live self push with appid {}", g_PlayingAppId);
+        LOG_RICHPRESENCE_INFO("Patched live self push with appid {}",
+                              g_PlayingAppId.load(std::memory_order_relaxed));
         return true;
     }
 
@@ -1049,8 +1573,9 @@ namespace Hooks_NetPacket_OnlineFix {
     bool HandleSend(const uint8* pBody, uint32 cbBody,
                     const uint8* pHdr, uint32 cbHdr)
     {
+        if (!pBody || cbBody == 0) return false;
         CMsgClientGamesPlayed msg;
-        if (!msg.ParseFromArray(pBody, cbBody)) {
+        if (!msg.ParseFromArray(pBody, static_cast<int>(cbBody))) {
             LOG_ONLINEFIX_WARN("OnlineFix: failed to parse CMsgClientGamesPlayed");
             return false;
         }
@@ -1064,29 +1589,28 @@ namespace Hooks_NetPacket_OnlineFix {
         const bool broadcast = Hooks_NetPacket_RichPresence::BroadcastEnabled();
 
         bool patched = false;
-        // 采用独立标记跟踪广播重写状态，与防锁库的 owner 掩码解耦，
-        // 避免带 owner 上报时跳过广播重写导致好友侧无状态。
+        // 采用独立标记跟踪广播重写状态：480 那条已经改写过名称之后，
+        // 就不再走下面按 RichPresence 重写游戏名的分支。
         bool didBroadcastRewrite = false;
-        int rewrittenIndex = -1;
         for (int i = 0; i < msg.games_played_size(); ++i) {
             auto* game = msg.mutable_games_played(i);
             AppId_t appid = static_cast<AppId_t>(game->game_id() & UINT32_MAX);
 
-            // SpawnProcess rewrites pGameID to 480, so game_id is already 480.
-            // Fill game_extra_info with the real game name.
-            if (broadcast && appid == kOnlineFixAppId) {
+            // SpawnProcess rewrites pGameID to the fake AppId, so game_id
+            // already carries it. Fill game_extra_info with the real game name.
+            if (broadcast && Hooks_Misc::IsOnlineFixActive() &&
+                appid == Hooks_Misc::GetOnlineFixAppId()) {
                 AppId_t realAppId = Hooks_Misc::ResolveAppId();
                 // 只排除占位值，不再要求 appid 在 Lua 名单里：正版拥有的游戏
                 // 加 -onlinefix 联机时同样要显示游戏名，否则好友侧只看到 480。
-                if (realAppId && realAppId != kOnlineFixAppId) {
+                if (realAppId && realAppId != appid) {
                     std::string name = Hooks_Misc::GetGameNameByAppID(realAppId);
                     if (!name.empty()) {
                         game->set_game_extra_info(name);
                         patched = true;
                         didBroadcastRewrite = true;
-                        rewrittenIndex = i;
-                        LOG_ONLINEFIX_INFO("OnlineFix: 480 -> name '{}' (real appid {})",
-                            name, realAppId);
+                        LOG_ONLINEFIX_INFO("OnlineFix: {} -> name '{}' (real appid {})",
+                            appid, name, realAppId);
                     }
                 }
             }
@@ -1095,9 +1619,12 @@ namespace Hooks_NetPacket_OnlineFix {
         // Rich Presence: rewrite topmost unowned game to use the first
         // available shortcut's game_id so the server broadcasts it as a
         // non-Steam game. Falls back to 480 if no shortcuts registered.
+        // 这一段排在家庭共享处理之前，优先级更高：用户开了好友播报就按播报走，
+        // 改完 480 之后后面的分支读到的是新值，自然不会再动它。
+        // 没开播报时这里整体跳过，家庭共享 + lua 才会落到专用分支改替代 id。
         if (broadcast && !didBroadcastRewrite) {
             AppId_t trackedId = Hooks_NetPacket_RichPresence::g_PlayingAppId;
-            if (trackedId != 0 && trackedId != kOnlineFixAppId && msg.games_played_size() > 0) {
+            if (trackedId != 0 && trackedId != Hooks_Misc::GetOnlineFixAppId() && msg.games_played_size() > 0) {
                 std::string name = Hooks_Misc::GetGameNameByAppID(trackedId);
                 if (!name.empty()) {
                     auto* topGame = msg.mutable_games_played(msg.games_played_size() - 1);
@@ -1113,23 +1640,66 @@ namespace Hooks_NetPacket_OnlineFix {
                     topGame->clear_owner_id();
                     patched = true;
                     didBroadcastRewrite = true;
-                    rewrittenIndex = msg.games_played_size() - 1;
                     LOG_ONLINEFIX_INFO("RichPresence: appid {} -> name '{}'", trackedId, name);
                 }
             }
         }
 
-        // 家庭共享并发保护：抹掉出借方 owner_id，服务器不再锁出借方的库。
-        // 广播重写过的条目跳过掩码，其 owner 已在重写时清空。
+        // 家庭共享相关的上报处理，按「lua 里有没有」和「Steam 有没有把它当
+        // 借来的」两个条件分成四种情况：
+        //
+        //   自购 + lua      : 走正版路线，报文原样透传（为了补 DLC 才写的 lua）
+        //   家庭共享 + lua  : 改成替代 AppId。服务器只要看到真实 appid 就会按
+        //                     共享许可记账、占用出借方名额；改写后它就认不出来。
+        //                     开了好友播报时这条走不到，前面广播段已经改成 480 了。
+        //   纯 lua 假入库   : 清空归属，服务器查不到这条 AppId 的许可记录，不占名额
+        //   纯家庭共享      : 还原成真实出借方，让客户端和服务器账本对得上，
+        //                     否则倒计时走完会断线；名额按 Steam 规则正常占用
         for (int i = 0; i < msg.games_played_size(); ++i) {
-            if (i == rewrittenIndex) continue;
             auto* game = msg.mutable_games_played(i);
-            if (game->has_owner_id() && game->owner_id() != 0 && game->owner_id() != 1) {
-                LOG_NETPACKET_INFO("FamilySharing: Masking owner_id {} -> 1 for game_id {}",
-                                   game->owner_id(), game->game_id());
-                game->set_owner_id(1);
+            const AppId_t playedAppId = static_cast<AppId_t>(game->game_id() & UINT32_MAX);
+            const AccountID_t reported = game->has_owner_id() ? game->owner_id() : 0;
+            const AccountID_t lender = Hooks_Package::GetFamilySharedOwner(playedAppId);
+            // inLua 传 true 会把已标记为真拥有的 AppId 排除掉：自购游戏写进
+            // lua 只是为了补 DLC，主游戏本身走正版路线，上报不能动它的报文。
+            const bool inLua = LuaConfig::HasDepot(playedAppId, true);
+
+            LOG_NETPACKET_DEBUG("FamilySharing: appid {} reported_owner={} lender_lookup={} inLua={}",
+                                playedAppId, reported, lender, inLua);
+
+            if (lender > 1 && inLua) {
+                // 共享游戏又写了 lua：改成替代 AppId 上报。服务器只要看到真实
+                // appid 就会按共享许可记账、占用出借方名额；换成别的 id 就认不出来。
+                // 这个 AppId 在服务器上不存在，所以既不会播报也不会记录时长。
+                game->set_game_id(kFamilySharedMaskAppId);
+                // 不填 game_extra_info：这个字段会被服务器拿去当播报的游戏名，
+                // 填上就等于告诉好友在玩什么，和「不播报」的目标相反。
+                game->clear_game_extra_info();
+                game->clear_owner_id();
                 patched = true;
+                LOG_NETPACKET_INFO("FamilySharing: appid {} -> {} (shared+lua, lender {})",
+                                   playedAppId, kFamilySharedMaskAppId, lender);
+                continue;
             }
+
+            if (inLua) {
+                // 纯 lua 假入库：清空归属，服务器查不到这条 AppId 的许可就
+                // 不按共享许可记账。自购场景在这之前已经被 owned 拦掉了，
+                // 走到这里的都是真正靠假许可跑起来的游戏。
+                if (reported != 0) {
+                    game->clear_owner_id();
+                    patched = true;
+                }
+                continue;
+            }
+
+            if (lender <= 1 || reported == lender) continue;
+
+            // 只有共享、没写 lua：还原真实出借方
+            game->set_owner_id(lender);
+            patched = true;
+            LOG_NETPACKET_INFO("FamilySharing: Restoring owner_id {} -> {} for game_id {}",
+                               reported, lender, playedAppId);
         }
         if (!patched) return false;
 
@@ -1138,7 +1708,7 @@ namespace Hooks_NetPacket_OnlineFix {
             LOG_ONLINEFIX_WARN("OnlineFix: encoded size {} exceeds buffer", g_cbSendNewBody);
             return false;
         }
-        if (!msg.SerializeToArray(g_SendNewBody, kMaxBodySize)) {
+        if (!msg.SerializeToArray(g_SendNewBody, static_cast<int>(sizeof(g_SendNewBody)))) {
             LOG_ONLINEFIX_WARN("OnlineFix: failed to SerializeToArray");
             return false;
         }
@@ -1205,7 +1775,7 @@ namespace Hooks_NetPacket_Cloud {
             case 2: {
                 uint64 len;
                 if (!ReadVarint(d, size, pos, len)) return false;
-                if (pos + len > size) return false;
+                if (len > size - pos) return false;
                 pos += static_cast<uint32>(len);
                 break;
             }
@@ -1449,6 +2019,14 @@ namespace {
         case HASH_JOB_GetManifestRequestCode:
             return Hooks_NetPacket_Manifest::HandleSend(pBody, cbBody, pHdr, cbHdr);
 
+        case HASH_JOB_GetGameAchievements:
+            Hooks_NetPacket_UserStats::HandleSend_GetGameAchievements(pBody, cbBody, pHdr, cbHdr);
+            return false;
+
+        case HASH_JOB_GetUserAchievements:
+            Hooks_NetPacket_UserStats::HandleSend_GetUserAchievements(pBody, cbBody, pHdr, cbHdr);
+            return false;
+
         // ---- add new 151 service methods here ----
         }
         return false;
@@ -1460,6 +2038,18 @@ namespace {
         g_NeedReplaceSend = false;
         g_SuppressSend    = false;
 
+        if (pHdr && cbHdr > 0 && Hooks_NetPacket_RichPresence::g_LocalSteamId.load(std::memory_order_relaxed) == 0) {
+            CMsgProtoBufHeader hdr;
+            if (hdr.ParseFromArray(pHdr, cbHdr) && hdr.has_steamid() && hdr.steamid()) {
+                std::lock_guard lock(Hooks_NetPacket_RichPresence::g_RPMutex);
+                if (Hooks_NetPacket_RichPresence::g_LocalSteamId.load(std::memory_order_relaxed) == 0) {
+                    Hooks_NetPacket_RichPresence::g_LocalSteamId.store(hdr.steamid(), std::memory_order_relaxed);
+                    CloudRedirectHost::SetAccountId(static_cast<uint32_t>(hdr.steamid() & 0xFFFFFFFF));
+                    LOG_ACHIEVEMENT_DEBUG("Captured local SteamID 0x{:X} from outbound packet", hdr.steamid());
+                }
+            }
+        }
+
         LOG_NETPACKET_DEBUG("Send eMsg {}({}) (cbBody={}, cbHdr={})",
                         MsgName(eMsg), static_cast<uint32>(eMsg), cbBody, cbHdr);
 
@@ -1467,7 +2057,7 @@ namespace {
 
         case k_EMsgServiceMethodCallFromClient: {   // 151
             CMsgProtoBufHeader hdr;
-            if (hdr.ParseFromArray(pHdr, cbHdr) && hdr.has_target_job_name()) {
+            if (pHdr && cbHdr > 0 && hdr.ParseFromArray(pHdr, static_cast<int>(cbHdr)) && hdr.has_target_job_name()) {
                 g_NeedReplaceSend = SendServiceJob(hdr.target_job_name().c_str(), pBody, cbBody, pHdr, cbHdr);
             }
             return;
@@ -1490,10 +2080,25 @@ namespace {
             g_NeedReplaceSend = Hooks_NetPacket_UserStats::HandleSend_ClientGetUserStats(pBody, cbBody);
             return;
 
-        case k_EMsgClientStoreUserStats2: {         // 5466
-            AppId_t appId = Hooks_NetPacket_RichPresence::g_PlayingAppId;
-            if (appId != 0)
+        case k_EMsgClientStoreUserStats:              // 820
+        case k_EMsgClientStoreUserStats2: {          // 5466
+            AppId_t appId = 0;
+            if (pBody && cbBody >= 9 && pBody[0] == 0x09) {
+                uint64 gameId = 0;
+                std::memcpy(&gameId, pBody + 1, sizeof(gameId));
+                appId = static_cast<AppId_t>(gameId & 0xFFFFFFFF);
+            }
+            if (appId == 0) {
+                appId = Hooks_NetPacket_RichPresence::g_PlayingAppId.load(std::memory_order_relaxed);
+            }
+            if (appId == Hooks_Misc::GetOnlineFixAppId() && Hooks_Misc::IsOnlineFixActive()) {
+                const AppId_t resolved = Hooks_Misc::ResolveAppId();
+                if (resolved != 0) appId = resolved;
+            }
+            if (appId != 0 && !LuaConfig::IsOwned(appId) &&
+                (LuaConfig::HasDepot(appId) || CloudRedirectHost::IsApp(appId))) {
                 CloudRedirectHost::NotifyStatsStored(appId);
+            }
             return;
         }
 
@@ -1506,6 +2111,7 @@ namespace {
                         const uint8* pBody, uint32 cbBody,
                         const uint8* pHdr, uint32 cbHdr)
     {
+        if (!targetJobName) return;
         LOG_NETPACKET_DEBUG("Recv target_job_name: {}", targetJobName);
         g_NeedReplaceBody = false;
         g_NeedReplaceHdr  = false;
@@ -1513,7 +2119,7 @@ namespace {
         switch (Fnv1aHash(targetJobName)) {
 
         case HASH_JOB_NotifyRunningApps:
-            Hooks_NetPacket_FamilySharing::HandleRecv_NotifyRunningApps(pBody, cbBody);
+            Hooks_NetPacket_FamilySharing::LogRunningApps(pBody, cbBody);
             return;
 
         case HASH_JOB_GetUserStats:
@@ -1524,11 +2130,19 @@ namespace {
             Hooks_NetPacket_Manifest::HandleRecv(pBody, cbBody, pHdr, cbHdr);
             return;
 
+        case HASH_JOB_GetGameAchievements:
+            Hooks_NetPacket_UserStats::HandleRecv_GetGameAchievementsResponse(pHdr, cbHdr, pBody, cbBody);
+            return;
+
+        case HASH_JOB_GetUserAchievements:
+            Hooks_NetPacket_UserStats::HandleRecv_GetUserAchievementsResponse(pHdr, cbHdr, pBody, cbBody);
+            return;
+
         // ---- add new 147 service methods here ----
         default:
-            // job 名带版本号后缀时走子串兜底，保证消毒逻辑不漏
+            // job 名带版本号后缀时走子串兜底，保证观测点不漏
             if (std::string_view(targetJobName).find("NotifyRunningApps") != std::string_view::npos) {
-                Hooks_NetPacket_FamilySharing::HandleRecv_NotifyRunningApps(pBody, cbBody);
+                Hooks_NetPacket_FamilySharing::LogRunningApps(pBody, cbBody);
                 return;
             }
             break;
@@ -1550,11 +2164,43 @@ namespace {
 
         switch (eMsg) {
 
+        // 掉线原因只在这条包里，协议是裸 varint：
+        // 字段 1 = eresult。不解出来只能看到"掉线了"，看不出为什么掉。
+        case k_EMsgClientLoggedOff: {                  // 757
+            // 字段 1 是 eresult，varint 编码。这里按最保守的方式解：
+            // 最多读 10 字节、每步先判位移再移位，任何畸形输入都只是解码失败，
+            // 不能越界读也不能产生未定义行为。
+            uint64 eresult = 0;
+            bool decoded = false;
+            if (cbBody > 0 && pBody[0] == 0x08) {
+                uint32 pos = 1;
+                uint32 shift = 0;
+                for (int consumed = 0; consumed < 10 && pos < cbBody; ++consumed) {
+                    const uint8 b = pBody[pos++];
+                    if (shift < 64) {
+                        eresult |= static_cast<uint64>(b & 0x7F) << shift;
+                    }
+                    if (!(b & 0x80)) {
+                        decoded = true;
+                        break;
+                    }
+                    shift += 7;
+                }
+            }
+            if (decoded) {
+                LOG_NETPACKET_INFO("ClientLoggedOff: eresult={} (0=无 1=OK 6=别处登录 34=会话被替换 38=远端断开)",
+                                   eresult);
+            } else {
+                LOG_NETPACKET_INFO("ClientLoggedOff: eresult not decodable ({} bytes)", cbBody);
+            }
+            return;
+        }
+
         case k_EMsgServiceMethod:                      // 146
         case k_EMsgServiceMethodResponse:              // 147
         case k_EMsgServiceMethodSendToClient: {        // 152
             CMsgProtoBufHeader hdr;
-            if (hdr.ParseFromArray(pHdr, cbHdr) && hdr.has_target_job_name())
+            if (pHdr && cbHdr > 0 && hdr.ParseFromArray(pHdr, static_cast<int>(cbHdr)) && hdr.has_target_job_name())
                 RecvServiceJob(hdr.target_job_name().c_str(), pBody, cbBody, pHdr, cbHdr);
             return;
         }
@@ -1569,9 +2215,14 @@ namespace {
                 pBody, cbBody);
             return;
 
-        case k_EMsgClientSharedLibraryLockStatus:      // 9405
+        case k_EMsgClientStoreUserStatsResponse:   // 821
+            Hooks_NetPacket_UserStats::HandleRecv_ClientStoreUserStatsResponse(
+                pHdr, cbHdr, pBody, cbBody);
+            return;
+
         case k_EMsgClientSharedLibraryStopPlaying:     // 9406
-            Hooks_NetPacket_FamilySharing::ClearBody(pBody, cbBody);
+            // 停玩通知照常交给 Steam 处理，这里只记录内容。
+            Hooks_NetPacket_FamilySharing::LogStopPlaying(pBody, cbBody);
             return;
 
         case k_EMsgClientPersonaState:                 // 766
@@ -1642,6 +2293,8 @@ namespace {
         // 也是同一对字段。认不出就直接过原函数，一个字节都不碰。
         if (!EnsurePacketLayout(pPacket))
             return oRecvPkt(pThis, pPacket);
+        // A packet whose buffer never got allocated has nothing to unpack.
+        if (!PktData(pPacket)) return oRecvPkt(pThis, pPacket);
 
         Hooks_NetPacket_RichPresence::TryInject(
             pThis, pPacket,
@@ -1652,6 +2305,10 @@ namespace {
             [](void* pT, CNetPacket* pP) -> bool { return oRecvPkt(pT, pP) != nullptr; });
 
         Hooks_NetPacket_LegacyKey::Drain(
+            pThis, pPacket,
+            [](void* pT, CNetPacket* pP) -> bool { return oRecvPkt(pT, pP) != nullptr; });
+
+        Hooks_NetPacket_UserStats::DrainAchievements(
             pThis, pPacket,
             [](void* pT, CNetPacket* pP) -> bool { return oRecvPkt(pT, pP) != nullptr; });
 

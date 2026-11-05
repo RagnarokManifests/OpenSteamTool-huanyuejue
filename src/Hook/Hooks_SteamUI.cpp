@@ -9,6 +9,7 @@
 #include <mutex>
 #include <string_view>
 #include <thread>
+#include <unordered_map>
 #include <unordered_set>
 #include <vector>
 #include <windows.h>
@@ -318,10 +319,47 @@ namespace
     CAPTURE_THIS_FUNC(GetAppByID, CSteamApp*, g_pController,void* pThis, AppId_t appId, bool bCreate);
     CAPTURE_THIS_FUNC(MarkAppChange,void*,g_pAppChangeSource,void* pThis,AppId_t appId, EAppChangeFlags changeFlags);
 
+    // Apps with update work in flight (download, staging, verify, paused
+    // mid-update...), plus child->parent so a DLC is covered while its base
+    // game updates. Fed from FillInAppOverview, read by IsAppUpdating.
+    std::mutex g_updatingMutex;
+    std::unordered_set<AppId_t> g_updating;
+    std::unordered_map<AppId_t, AppId_t> g_parentApp;
+
     HOOK_FUNC(FillInAppOverview, void *, void *pThis, void *pAppOverview, CSteamApp *pApp)
     {
+        if (pApp)
+        {
+            // The whole update lifecycle, including a paused mid-update, where
+            // a depot target change would land half-done state.
+            const bool updating = (pApp->AppStateFlags & (
+                k_EAppStateUpdateRunning | k_EAppStateUpdateStarted |
+                k_EAppStateUpdatePaused  | k_EAppStateDownloading |
+                k_EAppStateReconfiguring | k_EAppStateVerifyingInstalled |
+                k_EAppStatePreallocating | k_EAppStateStaging |
+                k_EAppStateCommitting    | k_EAppStateVerifyingStaged)) != 0;
+            std::lock_guard<std::mutex> lock(g_updatingMutex);
+            if (updating) g_updating.insert(pApp->nAppID);
+            else          g_updating.erase(pApp->nAppID);
+            if (pApp->ParentAppID)
+                g_parentApp[pApp->nAppID] = pApp->ParentAppID;
+        }
+
         if (pApp && LuaConfig::HasDepot(pApp->nAppID, false))
         {
+            // We forge ownership for configured apps, so a license that
+            // Steam reports as locked by another local user must not keep
+            // the Play button disabled. Scoped to configured apps only:
+            // stripping it globally would enable Play on shared games we
+            // do not inject for, which Steam then rejects at launch.
+            if (pApp->OwnershipFlags & k_EAppOwnershipFlags_LicenseLocked)
+            {
+                pApp->OwnershipFlags = static_cast<EAppOwnershipFlags>(
+                    pApp->OwnershipFlags & ~k_EAppOwnershipFlags_LicenseLocked);
+                LOG_STEAMUI_TRACE("FillInAppOverview: cleared LicenseLocked for appId={}",
+                                  pApp->nAppID);
+            }
+
             uint32_t t = LuaConfig::GetPurchaseTime(pApp->nAppID);
             if (t)
             {
@@ -513,5 +551,19 @@ namespace Hooks_SteamUI
         std::lock_guard<std::mutex> lock(g_removalMutex);
         std::erase(g_pendingRemovals, appId);
         g_removedAppIds.erase(appId);
+    }
+
+    bool IsAppUpdating(AppId_t appId)
+    {
+        std::lock_guard<std::mutex> lock(g_updatingMutex);
+        AppId_t id = appId;
+        for (int hops = 0; hops < 2; ++hops)
+        {
+            if (g_updating.contains(id)) return true;
+            auto it = g_parentApp.find(id);
+            if (it == g_parentApp.end()) break;
+            id = it->second;
+        }
+        return false;
     }
 }

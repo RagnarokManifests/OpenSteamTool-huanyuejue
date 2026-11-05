@@ -22,6 +22,7 @@ namespace {
         std::string remoteUrlTemplate;
         std::string remoteOrder = "gh-proxy-first";
         bool statsEnableApi = true;
+        bool updateEnabled = true;
         std::string presenceDisplay = "spacewar";
         InjectionSettings injection;
         CloudSettings cloud;
@@ -67,6 +68,7 @@ namespace {
         remoteUrlTemplate      = snapshot.remoteUrlTemplate;
         remoteOrder            = snapshot.remoteOrder;
         statsEnableApi         = snapshot.statsEnableApi;
+        updateEnabled          = snapshot.updateEnabled;
         presenceDisplay        = snapshot.presenceDisplay;
         injectEnabled          = snapshot.injection.enabled;
         injectLibraryX86       = snapshot.injection.libraryX86;
@@ -189,6 +191,12 @@ namespace {
                 }
             }
 
+            // [update]
+            if (auto update = tbl["update"].as_table()) {
+                if (auto val = (*update)["enabled"].value<bool>())
+                    snapshot.updateEnabled = *val;
+            }
+
             // [presence]
             if (auto presence = tbl["presence"].as_table()) {
                 if (auto val = (*presence)["display"].value<std::string>()) {
@@ -296,6 +304,11 @@ namespace {
     bool GetStatsEnableApi() {
         std::lock_guard lock(g_mutex);
         return statsEnableApi;
+    }
+
+    bool GetUpdateEnabled() {
+        std::lock_guard lock(g_mutex);
+        return updateEnabled;
     }
 
     bool GetPresenceBroadcastEnabled() {

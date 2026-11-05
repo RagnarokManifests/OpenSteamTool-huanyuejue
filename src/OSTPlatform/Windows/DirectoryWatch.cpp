@@ -35,9 +35,17 @@ struct Watch::Impl {
     std::vector<char> buffer;
     bool readPending = false;
 
+    ~Impl() {
+        Close();
+    }
+
     void Close() {
         if (dir) {
-            CancelIo(dir.get());
+            if (readPending) {
+                CancelIo(dir.get());
+                DWORD dummy = 0;
+                GetOverlappedResult(dir.get(), &overlapped, &dummy, TRUE);
+            }
         }
         dir.Reset();
         event.Reset();
@@ -98,7 +106,7 @@ bool Watch::IssueRead() {
             impl_->dir.get(),
             impl_->buffer.data(),
             static_cast<DWORD>(impl_->buffer.size()),
-            FALSE,
+            TRUE,
             FILE_NOTIFY_CHANGE_FILE_NAME | FILE_NOTIFY_CHANGE_LAST_WRITE,
             &dummy,
             &impl_->overlapped,
@@ -120,26 +128,40 @@ std::vector<Change> Watch::Drain() {
     if (!IsOpen() || !impl_->readPending) return changes;
 
     DWORD bytesReturned = 0;
-    if (!GetOverlappedResult(impl_->dir.get(), &impl_->overlapped, &bytesReturned, FALSE) ||
-        bytesReturned == 0) {
+    if (!GetOverlappedResult(impl_->dir.get(), &impl_->overlapped, &bytesReturned, FALSE)) {
+        if (GetLastError() == ERROR_IO_INCOMPLETE) {
+            return changes;
+        }
         impl_->readPending = false;
         return changes;
     }
 
     impl_->readPending = false;
-    const FILE_NOTIFY_INFORMATION* info =
-        reinterpret_cast<const FILE_NOTIFY_INFORMATION*>(impl_->buffer.data());
+    if (bytesReturned == 0) {
+        return changes;
+    }
+    const char* bufStart = impl_->buffer.data();
+    const char* bufEnd = bufStart + bytesReturned;
+    const char* current = bufStart;
 
-    while (info) {
-        std::wstring_view fileName(info->FileName, info->FileNameLength / sizeof(wchar_t));
+    while (current + sizeof(FILE_NOTIFY_INFORMATION) <= bufEnd) {
+        const auto* info = reinterpret_cast<const FILE_NOTIFY_INFORMATION*>(current);
+        const char* nameStart = reinterpret_cast<const char*>(info->FileName);
+        const size_t nameBytes = info->FileNameLength;
+        if (nameStart + nameBytes > bufEnd) {
+            break;
+        }
+
+        std::wstring_view fileName(info->FileName, nameBytes / sizeof(wchar_t));
         std::string relativePath = Encoding::WideToUtf8(fileName);
         if (!relativePath.empty()) {
             changes.push_back({std::move(relativePath), FromWindowsAction(info->Action)});
         }
 
         if (info->NextEntryOffset == 0) break;
-        info = reinterpret_cast<const FILE_NOTIFY_INFORMATION*>(
-            reinterpret_cast<const char*>(info) + info->NextEntryOffset);
+        const char* nextPtr = current + info->NextEntryOffset;
+        if (nextPtr <= current || nextPtr >= bufEnd) break;
+        current = nextPtr;
     }
 
     return changes;

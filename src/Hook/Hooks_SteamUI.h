@@ -31,4 +31,10 @@ namespace Hooks_SteamUI {
     void QueueRemoval(AppId_t appId);
     // Cancels a queued removal when the app is added again before the UI drains it.
     void CancelRemoval(AppId_t appId);
+
+    // True while Steam is doing update work (downloading, staging, verifying,
+    // paused mid-update, ...) for appId, or for its base game when appId is
+    // DLC. Fed from FillInAppOverview; safe from any thread. Used to keep the
+    // depot targets we hand Steam stable for the duration of an update.
+    bool IsAppUpdating(AppId_t appId);
 }

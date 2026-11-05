@@ -18,12 +18,19 @@ namespace {
         std::vector<Interface> interfaces;
         std::unordered_map<EIPCInterface, size_t> byID;
         std::unordered_map<std::string, size_t> byName;
+        std::unordered_map<uint64_t, const Method*> byMethodHash;
+
+        static uint64_t MakeMethodKey(EIPCInterface interfaceID, uint32_t funcHash)
+        {
+            return (static_cast<uint64_t>(interfaceID) << 32) | static_cast<uint64_t>(funcHash);
+        }
 
         void Clear()
         {
             interfaces.clear();
             byID.clear();
             byName.clear();
+            byMethodHash.clear();
         }
 
         void Add(Interface iface)
@@ -34,12 +41,26 @@ namespace {
             interfaces.push_back(std::move(iface));
         }
 
+        void BuildIndex()
+        {
+            byMethodHash.clear();
+            for (const auto& iface : interfaces) {
+                for (const auto& method : iface.methods) {
+                    byMethodHash[MakeMethodKey(method.interfaceID, method.funcHash)] = &method;
+                }
+            }
+        }
+
         const Method* Find(EIPCInterface interfaceID, uint32_t funcHash) const
         {
-            const auto it = byID.find(interfaceID);
-            if (it == byID.end()) return nullptr;
+            const auto it = byMethodHash.find(MakeMethodKey(interfaceID, funcHash));
+            if (it != byMethodHash.end()) return it->second;
 
-            for (const auto& method : interfaces[it->second].methods) {
+            // Fallback if index has not been built
+            const auto ifaceIt = byID.find(interfaceID);
+            if (ifaceIt == byID.end()) return nullptr;
+
+            for (const auto& method : interfaces[ifaceIt->second].methods) {
                 if (method.funcHash == funcHash) return &method;
             }
             return nullptr;
@@ -197,22 +218,25 @@ static TryResult TryLoadOnce(const std::string& steamclientPath, std::string& sh
 
     if (!r.ok) return TryResult::Fatal;
 
-    toml::table root;
+    // Parse and consume inside one try: a malformed body must leave the
+    // registry empty (all-or-nothing) rather than half-populated, since the
+    // only exceptions toml::parse can raise here are parse_error and bad_alloc.
     try {
-        root = toml::parse(r.body);
+        toml::table root = toml::parse(r.body);
+        for (auto& [key, val] : root) {
+            if (!val.is_table()) continue;
+            Interface iface;
+            if (!ParseInterfaceTable(key.str(), *val.as_table(), iface)) continue;
+
+            g_registry.Add(std::move(iface));
+        }
     } catch (const toml::parse_error& e) {
         LOG_WARN("IPCLoader: TOML parse error: {}", e.description());
         // 缓存截断才值得重下；远端坏内容重下也一样。
         return fromCache ? TryResult::Retryable : TryResult::Fatal;
     }
 
-    for (auto& [key, val] : root) {
-        if (!val.is_table()) continue;
-        Interface iface;
-        if (!ParseInterfaceTable(key.str(), *val.as_table(), iface)) continue;
-
-        g_registry.Add(std::move(iface));
-    }
+    g_registry.BuildIndex();
 
     if (!HasRequiredInterfaces()) {
         // 远端坏内容重下也没用；只有缓存串台才值得自愈。

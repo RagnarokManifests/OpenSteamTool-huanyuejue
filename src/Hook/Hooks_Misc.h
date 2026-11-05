@@ -5,7 +5,7 @@
 // Catch-all for lightweight info-capture int3 traps and launch-time rewrites
 // that don't fit a dedicated category — currently:
 //   * GetAppIDForCurrentPipe  -> captures the SteamEngine pointer
-//   * SpawnProcess            -> OnlineFix detection + 480 rewrite
+//   * SpawnProcess            -> OnlineFix detection + fake AppId rewrite
 //   * GetAppDataFromAppInfo   -> captures the CAppInfoCache pointer
 namespace Hooks_Misc {
     void Install();
@@ -26,6 +26,11 @@ namespace Hooks_Misc {
 
     // 当前是否有 -onlinefix 游戏正在运行。
     bool IsOnlineFixActive();
+
+    // AppId the running -onlinefix game is disguised as: the one given with
+    // -onlinefix=<appid>, or kOnlineFixAppId (480, SpaceWar) by default.
+    // Returns kOnlineFixAppId when no -onlinefix game is running.
+    AppId_t GetOnlineFixAppId();
 
     // 游戏首次走 SteamNetworkingSockets 时调用，标记 P2P 已启动。
     void NotifyNetworkingSocketsUsed();

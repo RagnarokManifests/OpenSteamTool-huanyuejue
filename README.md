@@ -53,8 +53,14 @@
 - 通过 `opensteamtool.toml` 中的 `[inject]` 添加可选的游戏进程库注入
 - 配置 `enabled`、`library_x64` 和 `library_x86`；注入的库必须与目标进程架构匹配。路径可以是绝对路径，也可以是相对于 Steam 根目录的相对路径
 
-### 家庭共享和远程同乐
-- 零配置绕过 Steam 家庭共享限制：出借方库不被锁定，借用游戏去掉借用与锁定标记
+### 家庭共享
+- 家庭共享的游戏可以直接游玩。写进 Lua 后可以和家庭成员同时玩同一款游戏，走的是假入库分支，不占用出借方的运行名额
+- 走正版路径已经行不通了。Steam 收紧了服务端的共享鉴权，改成按自己的许可账本判定会话，客户端上报的归属它不再采信。之前那套「上报时把 owner 改回真实出借方」的做法只会让客户端和服务器的账对不上，倒计时走完就断线
+- 现在的做法是让这类游戏彻底脱离共享逻辑：本地许可判定按假入库处理，共享标记全部清掉，上报游玩状态时把 AppId 换成一个服务器上不存在的值。服务器认不出这是共享游戏，既不计入名额也不下发停玩通知
+- 代价是这类游戏不再走正版路径：购买状态、成就、时长都挂在假许可上，好友侧也看不到真实的游玩状态。这是为了能同时玩而做的取舍
+- 没写进 Lua 的共享游戏仍按 Steam 原生规则走：占用出借方的运行名额，出借方需要时会被收回，这部分不受本工具干预
+- 开启好友播报（`[presence] display = "spacewar"`）时，这类游戏会改回 Spacewar 上报，好友能看到你在玩什么，代价是时长会记到 Spacewar 上
+- 补充说明：写进 Lua 的自购游戏不受影响，仍按正版路径运行。判定依据是这条许可在 Steam 的多个包里都出现过，说明确实是自己买的
 
 ### 兼容 Denuvo 和 SteamStub 保护的游戏
 - 仅 SteamStub 保护的游戏不需要配置 `AppTicket`。OpenSteamTool 可以重用 Steam 本地 ConfigStore 令牌，通过 SteamDRMP 令牌解析漏洞伪造请求的 AppId，无需注入游戏进程
@@ -98,7 +104,7 @@
 ### 统计和成就
 - 为未拥有的游戏启用统计和成就
 - 使用 `setStat(appid, "steamid")` 配置拉取哪个 SteamID 的成就数据
-- 如果某个应用未配置 `setStat`，当 `[stats] enable_api = true`（默认）时，OpenSteamTool 查询 `https://stats.opensteamtool.com/{appid}`
+- 如果某个应用未配置 `setStat`，当 `[stats] enable_api = true`（默认）时，OpenSteamTool 查询 `https://stats.luastools.xyz/{appid}`
 - 优先级：`setStat` > stats API（启用且有效时）> 硬编码预设 SteamID `76561198028121353`
 
 ### 在线修复
@@ -106,6 +112,7 @@
 - 该参数不要求游戏在 Lua 解锁名单里，正版拥有的游戏一样可以用来联机
 - 若游戏启动后卡在加载界面、黑屏或登录后行为异常，在启动参数里再加上 `-realappid`：`-onlinefix -realappid`。加入后游戏询问自身 appid 时会如实返回真实值，而不是伪装成 480
 - 两种行为由不同游戏各自需要，且无法自动判断，所以只能按局指定：需要 480 才能联机的游戏不加 `-realappid`，被 480 卡住的游戏加上它
+- 可用 `-onlinefix=<appid>` 指定伪装成 480 以外的 AppId（如 `-onlinefix=1234`），用于封禁了 480 或 480 大厅列表混入其他游戏房间的游戏。该 AppId 必须是免费或你账号已拥有的，且联机的所有人都要使用相同的值
 
 ## 未来计划
 - Steam 云同步支持。（这是个超级大工程）
@@ -176,7 +183,7 @@ timeout_send_ms    = 10000
 timeout_recv_ms    = 10000
 
 [stats]
-# 当没有 Lua setStat 覆盖时查询 https://stats.opensteamtool.com/{appid}
+# 当没有 Lua setStat 覆盖时查询 https://stats.luastools.xyz/{appid}
 # 优先级：setStat > stats API > 硬编码预设 SteamID
 enable_api = true
 

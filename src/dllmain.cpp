@@ -8,6 +8,11 @@
 #include "Utils/SteamMetadata/IPCLoader.h"
 #include "Utils/SteamMetadata/PatternLoader.h"
 #include "Utils/SteamMetadata/SteamDiagnostics.h"
+#include "Utils/Support/AcfSizeRepair.h"
+#include "Utils/Support/DepotManifestSync.h"
+#ifdef OST_ENABLE_UPDATER
+#include "Utils/Update/ReleaseUpdater.h"
+#endif
 #include "OSTPlatform/include/DynamicLibrary.h"
 #include "OSTPlatform/include/Thread.h"
 
@@ -231,9 +236,7 @@ bool InitializeSteamComponents()
 // All initialisation that touches the filesystem, loads modules, scans
 // memory, or installs detours runs here on a worker thread — we MUST NOT do
 // any of that from inside DllMain (loader lock).
-static uint32_t InitThread(OSTPlatform::DynamicLibrary::ModuleHandle selfModule) {
-    Log::Init(selfModule);
-    LOG_INFO("OpenSteamTool init thread started");
+static uint32_t InitThreadInner(OSTPlatform::DynamicLibrary::ModuleHandle selfModule) {
     LOG_INFO("OpenSteamTool attach: steamclient64 already mapped = {} ({})",
              g_steamClientMappedAtAttach,
              g_steamClientMappedAtAttach
@@ -287,6 +290,10 @@ static uint32_t InitThread(OSTPlatform::DynamicLibrary::ModuleHandle selfModule)
     watchDirs.push_back(std::string(LuaDir));
     for (const auto& dir : watchDirs)
         LuaConfig::ParseDirectory(dir);
+    // Depot manifests shipped next to the Lua scripts go into depotcache so
+    // Steam does not have to download them.
+    for (const auto& dir : watchDirs)
+        DepotManifestSync::InstallFromDirectory(dir, SteamInstallPath);
 
     LuaFileWatcher::Start(watchDirs);
     ConfigFileWatcher::Start(ConfigPath, LuaDir);
@@ -306,7 +313,45 @@ static uint32_t InitThread(OSTPlatform::DynamicLibrary::ModuleHandle selfModule)
     // 超时回退看门狗：只在隔离启用时才有事可做，直连原版时不启线程。
     if (g_IsDiversionActive.load())
         OSTPlatform::Thread::StartDetached([] { return DiversionWatchdog(); });
+
+#ifdef OST_ENABLE_UPDATER
+    // Update notice: asks before installing a newer release; never silent.
+    if (Config::GetUpdateEnabled())
+        ReleaseUpdater::StartAsync(SteamInstallPath);
+#endif
+
+    // Fix library entries whose appmanifest SizeOnDisk is stuck at 0 (games
+    // showing "0 B" in the library). Own detached thread: it walks every
+    // install directory on disk and can take seconds. Idempotent, and Steam
+    // only re-reads these files on its next operation, so a restart after
+    // this has run is what refreshes the library view.
+    OSTPlatform::Thread::StartDetached([]() -> uint32_t {
+        const int repaired = AcfSizeRepair::RepairAll(SteamInstallPath);
+        if (repaired > 0)
+            LOG_INFO("AcfSizeRepair: repaired {} appmanifest file(s); restart "
+                     "Steam to refresh the library view", repaired);
+        return 0;
+    });
     return 0;
+}
+
+// Barrier around InitThreadInner: any exception that escapes a hook install,
+// pattern load or config parse would otherwise reach std::terminate and take
+// Steam down with it. Log and bail instead — Steam runs unhooked, which is
+// strictly better than a crash on launch.
+static uint32_t InitThread(OSTPlatform::DynamicLibrary::ModuleHandle selfModule) {
+    Log::Init(selfModule);
+    LOG_INFO("OpenSteamTool init thread started");
+
+    try {
+        return InitThreadInner(selfModule);
+    } catch (const std::exception& e) {
+        LOG_ERROR("OpenSteamTool init aborted: {}", e.what());
+        return 1;
+    } catch (...) {
+        LOG_ERROR("OpenSteamTool init aborted: unknown exception");
+        return 1;
+    }
 }
 
 BOOL APIENTRY DllMain(HMODULE hModule, DWORD dwReason, PVOID pvReserved)
@@ -315,6 +360,13 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD dwReason, PVOID pvReserved)
     {
         DisableThreadLibraryCalls(hModule);
         g_steamClientMappedAtAttach = (GetModuleHandleW(L"steamclient64.dll") != nullptr);
+
+        // Keep this module pinned so explicit FreeLibrary cannot unload code
+        // while hooks and worker threads may still reference it.
+        HMODULE pinnedModule = nullptr;
+        GetModuleHandleExA(
+            GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_PIN,
+            reinterpret_cast<LPCSTR>(&DllMain), &pinnedModule);
         // Hand off all real work to a worker thread to avoid running file I/O,
         // module loading and detour transactions under the loader lock.
         OSTPlatform::Thread::StartDetached([module = reinterpret_cast<OSTPlatform::DynamicLibrary::ModuleHandle>(hModule)] {
@@ -326,11 +378,28 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD dwReason, PVOID pvReserved)
         g_HooksInstalled.store(false);
         g_IsDiversionActive.store(false);
         g_DiversionAdopted.store(false);
-        ConfigFileWatcher::Stop();
-        LuaFileWatcher::Stop();
-        SteamUI::CoreUnhook();
-        SteamClient::CoreUnhook();
-        CloudRedirectHost::Shutdown();
+        // DllMain runs under loader lock. During process termination
+        // (pvReserved != nullptr) the OS has already terminated every other
+        // thread, so a join() on a watcher thread or a Detours transaction
+        // here can deadlock Steam on shutdown. Tear down only on an explicit
+        // FreeLibrary.
+        if (pvReserved == nullptr)
+        {
+            ConfigFileWatcher::Stop();
+            LuaFileWatcher::Stop();
+            SteamUI::CoreUnhook();
+            SteamClient::CoreUnhook();
+            CloudRedirectHost::Shutdown();
+        }
+        else
+        {
+            // Process exit: the watcher threads are gone already. Their
+            // std::thread objects must not be destroyed while still joinable,
+            // or the module's static destructors call std::terminate and Steam
+            // exits with 0xc0000409 inside this DLL.
+            ConfigFileWatcher::AbandonOnProcessExit();
+            LuaFileWatcher::AbandonOnProcessExit();
+        }
     }
 
     return TRUE;

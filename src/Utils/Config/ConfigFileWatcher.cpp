@@ -4,6 +4,8 @@
 #include "Utils/Config/LuaFileWatcher.h"
 #include "Utils/Config/ConfigFileWatcher.h"
 #include "Utils/Logging/Log.h"
+#include "Utils/Support/DepotManifestSync.h"
+#include "dllmain.h"
 #include "OSTPlatform/include/DirectoryWatch.h"
 
 #include <atomic>
@@ -56,6 +58,8 @@ void RestartLuaWatcher() {
 
     LuaFileWatcher::Stop();
     LuaConfig::ReloadDirectories(watchDirs);
+    for (const auto& dir : watchDirs)
+        DepotManifestSync::InstallFromDirectory(dir, SteamInstallPath);
     LuaFileWatcher::Start(watchDirs);
 
     Hooks_Package::NotifyLicenseChanged();
@@ -79,6 +83,13 @@ void ReloadConfig() {
 }
 
 void WatcherThread() {
+    // If this thread exits on any path without clearing g_running, Start()
+    // would refuse every later attempt for the life of the process.
+    struct RunningGuard {
+        std::atomic<bool>& flag;
+        ~RunningGuard() { flag.store(false, std::memory_order_release); }
+    } runningGuard{g_running};
+
     const std::filesystem::path configPath(g_configPath);
     const std::filesystem::path dirPath = configPath.parent_path();
     const std::string targetFileName = configPath.filename().string();
@@ -147,6 +158,12 @@ void Stop() {
     if (g_watcherThread.joinable()) {
         g_watcherThread.join();
     }
+}
+
+void AbandonOnProcessExit() {
+    g_running = false;
+    if (g_watcherThread.joinable())
+        g_watcherThread.detach();
 }
 
 } // namespace ConfigFileWatcher

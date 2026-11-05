@@ -12,6 +12,8 @@ namespace OSTPlatform::Http {
         bool ok = false;
     };
 
+    constexpr size_t kDefaultMaxResponseBodyBytes = 16 * 1024 * 1024; // 16 MiB
+
     Result Execute(const wchar_t* method,
                    const char* url,
                    const void* reqBody = nullptr,
@@ -20,6 +22,9 @@ namespace OSTPlatform::Http {
                    uint32_t timeoutResolve = 5000,
                    uint32_t timeoutConnect = 5000,
                    uint32_t timeoutSend = 10000,
-                   uint32_t timeoutRecv = 10000);
+                   uint32_t timeoutRecv = 10000,
+                   // Upper bound on the response body read into memory. The default
+                   // suits small metadata (TOML/JSON); larger pages must raise it.
+                   uint32_t maxBodyBytes = 256 * 1024);
 
 } // namespace OSTPlatform::Http

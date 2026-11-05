@@ -435,3 +435,4 @@ struct CSteamApp
 	AppId_t ParentAppID;
 };
 #pragma pack(pop)
+static_assert(sizeof(CSteamApp) == (sizeof(void*) == 8 ? 0x44 : 0x40), "CSteamApp size mismatch");

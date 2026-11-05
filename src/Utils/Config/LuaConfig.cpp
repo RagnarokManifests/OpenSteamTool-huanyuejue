@@ -7,9 +7,12 @@
 
 #include <lua.hpp>
 
+#include <algorithm>
 #include <cctype>
 #include <cstdint>
 #include <fstream>
+#include <iterator>
+#include <sstream>
 #include <string>
 #include <unordered_set>
 #include <vector>
@@ -20,17 +23,17 @@ extern "C" {
 
 namespace LuaConfig{
     static lua_State* g_lua_state = nullptr;
-    static bool g_hasManifestCodeFunc = false;
-    static bool g_hasManifestCodeFuncEx = false;
-    std::unordered_map<AppId_t, std::string>DepotKeySet{};
-    std::unordered_map<AppId_t, uint64_t>AccessTokenSet{};
-    std::unordered_map<AppId_t, std::string>LegacyCDKeySet{};
-    std::unordered_set<AppId_t> PinnedApps{};
-    std::unordered_map<uint64_t, ManifestOverride> ManifestOverrides{};
-    std::unordered_map<AppId_t, uint64_t> StatSteamIdSet{};
-    std::unordered_set<AppId_t> OwnedAppIdSet{};
+    static std::atomic<bool> g_hasManifestCodeFunc{false};
+    static std::atomic<bool> g_hasManifestCodeFuncEx{false};
+    static std::unordered_map<AppId_t, std::string>DepotKeySet{};
+    static std::unordered_map<AppId_t, uint64_t>AccessTokenSet{};
+    static std::unordered_map<AppId_t, std::string>LegacyCDKeySet{};
+    static std::unordered_set<AppId_t> PinnedApps{};
+    static std::unordered_map<uint64_t, ManifestOverride> ManifestOverrides{};
+    static std::unordered_map<AppId_t, uint64_t> StatSteamIdSet{};
+    static std::unordered_set<AppId_t> OwnedAppIdSet{};
     // forcedenuvo(appid)：识别漏判时手动指定该游戏按 Denuvo 处理。
-    std::unordered_set<AppId_t> ForcedDenuvoSet{};
+    static std::unordered_set<AppId_t> ForcedDenuvoSet{};
 
     // Per-file tracking: which depots each .lua file contributed.
     static std::string g_currentFile;
@@ -560,11 +563,18 @@ namespace LuaConfig{
         return PinnedApps.count(AppId);
     }
 
+    void PrewarmStatSteamId(AppId_t AppId) {
+        if (AppId == k_uAppIdInvalid) return;
+        if (StatSteamIdSet.contains(AppId))
+            return;
+        StatsClient::PrewarmStatSteamId(AppId);
+    }
+
     uint64_t GetStatSteamId(AppId_t AppId) {
         if (StatSteamIdSet.count(AppId))
             return StatSteamIdSet[AppId];
         uint64_t apiSteamId = 0;
-        if (StatsClient::FetchStatSteamId(AppId, &apiSteamId))
+        if (StatsClient::TryGetCachedStatSteamId(AppId, &apiSteamId))
             return apiSteamId;
         return kDefaultStatSteamId;
     }
@@ -719,6 +729,46 @@ namespace LuaConfig{
         g_fileMtime.erase(filePath);
     }
 
+    // Unload every tracked file that lives under `directory`. Deleting or
+    // moving a whole folder only raises one change for the folder itself, so
+    // the per-file unloads never arrive on their own.
+    void UnloadDirectory(const std::string& directory) {
+        std::string prefix = directory;
+        while (!prefix.empty() && (prefix.back() == '\\' || prefix.back() == '/'))
+            prefix.pop_back();
+        if (prefix.empty()) return;
+        prefix += '\\';
+
+        auto underPrefix = [&](const std::string& path) {
+            if (path.size() <= prefix.size()) return false;
+            return std::equal(prefix.begin(), prefix.end(), path.begin(), [](char a, char b) {
+                auto norm = [](char c) {
+                    return c == '/' ? '\\' : static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+                };
+                return norm(a) == norm(b);
+            });
+        };
+
+        std::vector<std::string> victims;
+        for (const auto& [file, _] : g_fileParseSequence)
+            if (underPrefix(file)) victims.push_back(file);
+        for (const auto& file : victims)
+            UnloadFile(file);
+        if (!victims.empty())
+            LOG_PACKAGE_INFO("UnloadDirectory: unloaded {} Lua file(s) under {}", victims.size(), directory);
+    }
+
+    static std::vector<std::string> CollectLuaFiles(const std::string& directory);
+
+    // Parse every Lua file under a folder that appeared after startup (pasted
+    // or renamed into a watched directory). Unlike ParseDirectory it keeps the
+    // pending additions so the license refresh picks them up.
+    void ParseSubdirectory(const std::string& directory) {
+        if (!Initialize()) return;
+        for (const auto& filePath : CollectLuaFiles(directory))
+            ParseFile(filePath);
+    }
+
     std::vector<AppId_t> TakePendingRemovals() {
         std::vector<AppId_t> result;
         result.swap(g_pendingRemovals);
@@ -731,6 +781,15 @@ namespace LuaConfig{
         return result;
     }
 
+    // ".lua" in any letter case: packs made on other tools ship "1234.LUA" too.
+    static bool IsLuaExtension(const std::filesystem::path& path) {
+        const std::string ext = path.extension().string();
+        return ext.size() == 4 &&
+               std::equal(ext.begin(), ext.end(), ".lua", [](char a, char b) {
+                   return std::tolower(static_cast<unsigned char>(a)) == b;
+               });
+    }
+
     static std::vector<std::string> CollectLuaFiles(const std::string& directory) {
         std::vector<std::string> files;
 
@@ -740,11 +799,21 @@ namespace LuaConfig{
         if (!std::filesystem::exists(directory, ec) || !std::filesystem::is_directory(directory, ec))
             return files;
 
-        for (const auto& entry : std::filesystem::directory_iterator(directory, ec)) {
-            if (ec) break;
-            if (!entry.is_regular_file()) continue;
-            if (entry.path().extension() != ".lua") continue;
-            files.push_back(entry.path().string());
+        std::vector<std::filesystem::path> pending = { std::filesystem::path(directory) };
+        while (!pending.empty()) {
+            std::filesystem::path current = pending.back();
+            pending.pop_back();
+
+            std::error_code dec;
+            for (const auto& entry : std::filesystem::directory_iterator(current, dec)) {
+                if (dec) break;
+                std::error_code fec;
+                if (entry.is_directory(fec)) {
+                    pending.push_back(entry.path());
+                } else if (entry.is_regular_file(fec) && IsLuaExtension(entry.path())) {
+                    files.push_back(entry.path().string());
+                }
+            }
         }
         return files;
     }
@@ -781,9 +850,37 @@ namespace LuaConfig{
             g_fileMtime[filePath] = mtime;
         }
 
+        std::string source((std::istreambuf_iterator<char>(file)),
+                           std::istreambuf_iterator<char>());
+        // Editors such as Notepad save UTF-8 with a BOM, which Lua rejects.
+        if (source.starts_with("\xEF\xBB\xBF"))
+            source.erase(0, 3);
+
+        // Run the whole file as one chunk first, so `local` helpers stay
+        // visible to the functions that use them (manifest.lua scripts written
+        // by launchers define `local function ...` next to
+        // fetch_manifest_code). Fall back to statement-by-statement only when
+        // the file does not compile or stops on a runtime error, so one bad
+        // line still cannot keep the rest of the file from loading. Re-running
+        // statements is safe: each depot counts once per file.
+        lua_settop(g_lua_state, 0);
+        const std::string chunkName = "@" + path.filename().string();
+        bool wholeFileOk = false;
+        if (luaL_loadbuffer(g_lua_state, source.data(), source.size(), chunkName.c_str()) == LUA_OK) {
+            if (lua_pcall(g_lua_state, 0, 0, 0) == LUA_OK) {
+                wholeFileOk = true;
+            } else {
+                const char* err = lua_tostring(g_lua_state, -1);
+                LOG_WARN("{}: {} (retrying statement by statement)", path.filename().string(),
+                         err ? err : "unknown");
+            }
+        }
+        lua_settop(g_lua_state, 0);
+
+        std::istringstream lines(wholeFileOk ? std::string() : source);
         std::string chunk, line;
         int lineNo = 0;
-        while (std::getline(file, line)) {
+        while (std::getline(lines, line)) {
             ++lineNo;
             if (!chunk.empty()) chunk += '\n';
             chunk += line;

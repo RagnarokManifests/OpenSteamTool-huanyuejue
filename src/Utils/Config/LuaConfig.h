@@ -22,6 +22,7 @@ namespace LuaConfig{
     // setlegacycdkey(appid, "KEY"); nullopt when no override is configured.
     std::optional<std::string> GetLegacyCDKey(AppId_t appId);
     uint64_t GetStatSteamId(AppId_t appId);
+    void PrewarmStatSteamId(AppId_t appId);
     bool pinApp(AppId_t appId);
     uint32_t GetPurchaseTime(AppId_t appId);
 
@@ -33,6 +34,10 @@ namespace LuaConfig{
 
     void ParseFile(const std::string& filePath);
     void UnloadFile(const std::string& filePath);
+    // Unload every Lua file tracked under a folder (folder deleted or moved).
+    void UnloadDirectory(const std::string& directory);
+    // Parse every Lua file under a folder added after startup.
+    void ParseSubdirectory(const std::string& directory);
     // Returns and clears the list of depot IDs removed/added since last call.
     std::vector<AppId_t> TakePendingRemovals();
     std::vector<AppId_t> TakePendingAdditions();

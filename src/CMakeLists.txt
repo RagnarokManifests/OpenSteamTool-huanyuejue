@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
-project(OpenSteamTool VERSION 1.0.0 LANGUAGES C CXX)
+project(OpenSteamTool VERSION 1.5.4.1 LANGUAGES C CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -28,6 +28,9 @@ if(NOT WIN32)
     message(STATUS "OpenSteamTool: no targets on non-Windows platforms; skipping.")
     return()
 endif()
+
+# Keep the Windows min/max macros from clobbering std::min/std::max.
+add_compile_definitions(NOMINMAX)
 
 file(MAKE_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/generated")
 configure_file(
@@ -113,14 +116,18 @@ add_library(OpenSteamTool SHARED
     Utils/Config/LuaConfig.cpp
     Utils/Config/LuaFileWatcher.cpp
     Utils/CloudRedirect/CloudRedirectHost.cpp
+    Utils/Achievements/LocalAchievements.cpp
     Utils/HookSupport/VehCommon.cpp
     Utils/Logging/Log.cpp
+    Utils/SteamMetadata/AchSchema.cpp
     Utils/SteamMetadata/IPCLoader.cpp
     Utils/SteamMetadata/ManifestClient.cpp
     Utils/SteamMetadata/PatternLoader.cpp
     Utils/SteamMetadata/RemoteToml.cpp
     Utils/SteamMetadata/StatsClient.cpp
     Utils/SteamMetadata/SteamDiagnostics.cpp
+    Utils/Support/AcfSizeRepair.cpp
+    Utils/Support/DepotManifestSync.cpp
 
     # Pipe subsystem: generic handshake registry + ProcessInspector core, plus
     # self-contained features that own their primitives.
@@ -169,9 +176,25 @@ target_link_libraries(OpenSteamTool PRIVATE
 )
 
 # Logging is compiled in only for Debug; Release reduces LOG_* to no-ops.
+# 版本号同时以宏的形式带进编译，诊断日志据此打印版本。
 target_compile_definitions(OpenSteamTool PRIVATE
     $<$<CONFIG:Debug>:OPENSTEAMTOOL_LOGGING_ENABLED>
+    OPENSTEAMTOOL_VERSION="${OPENSTEAMTOOL_VERSION}"
 )
+
+# Update notice: published releases build with -DOST_ENABLE_UPDATER=ON so the
+# DLL asks before installing a newer release from OST_UPDATE_REPO. Off by
+# default, so a local build never offers to replace itself.
+option(OST_ENABLE_UPDATER "Ask to install newer GitHub releases" OFF)
+set(OST_UPDATE_REPO "RagnarokManifests/OpenSteamTool-huanyuejue" CACHE STRING
+    "GitHub owner/repo whose releases the update notice follows")
+if(OST_ENABLE_UPDATER)
+    target_sources(OpenSteamTool PRIVATE Utils/Update/ReleaseUpdater.cpp)
+    target_compile_definitions(OpenSteamTool PRIVATE
+        OST_ENABLE_UPDATER
+        OST_UPDATE_REPO="${OST_UPDATE_REPO}"
+    )
+endif()
 
 # ---------------------------------------------------------------------------
 # dwmapi.dll hijack — anti-cheat friendly loader DLL.

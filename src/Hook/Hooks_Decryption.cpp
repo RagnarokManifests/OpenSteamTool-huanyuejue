@@ -21,7 +21,7 @@ namespace {
             if (size_t start = name.find_last_of("\\", last - 1); start != std::string::npos) {
                 AppId_t depotId = std::stoul(name.substr(start + 1, last - start - 1));
                 if (const auto& key = LuaConfig::GetDecryptionKey(depotId); !key.empty()) {
-                    if (KeySize >= key.size()) {
+                    if (Key && KeySize >= key.size()) {
                         LOG_DECRYPTIONKEY_INFO("Providing decryption key for depot {}: {}", depotId,
                                                spdlog::to_hex(key.data(), key.data() + key.size()));
                         memcpy(Key, key.data(), key.size());
@@ -41,7 +41,10 @@ namespace {
             return {};
         }
 
-        std::vector<uint8_t> value(1024);
+        constexpr size_t kInitialBufferSize = 4096;
+        constexpr int32  kMaxSafeBufferSize  = 1024 * 1024; // 1MB safe ceiling
+
+        std::vector<uint8_t> value(kInitialBufferSize);
         int32 result = oConfigStoreGetBinary(g_pConfigStoreLocal, k_EConfigStoreUserLocal,
                                              keyName.c_str(),
                                              reinterpret_cast<char*>(value.data()),
@@ -51,7 +54,27 @@ namespace {
             return {};
         }
 
-        value.resize(result);
+        if (result > static_cast<int32>(value.size())) {
+            if (result > kMaxSafeBufferSize) {
+                LOG_DECRYPTIONKEY_WARN("GetConfigStoreLocalBinary: requested size {} exceeds maximum safe limit {} for KeyName='{}'",
+                                       result, kMaxSafeBufferSize, keyName);
+                return {};
+            }
+            LOG_DECRYPTIONKEY_DEBUG("GetConfigStoreLocalBinary: buffer truncated ({}/{}), resizing and retrying for KeyName='{}'",
+                                   value.size(), result, keyName);
+            value.resize(static_cast<size_t>(result));
+            result = oConfigStoreGetBinary(g_pConfigStoreLocal, k_EConfigStoreUserLocal,
+                                           keyName.c_str(),
+                                           reinterpret_cast<char*>(value.data()),
+                                           static_cast<uint32>(value.size()));
+            if (result <= 0 || result > static_cast<int32>(value.size())) {
+                LOG_DECRYPTIONKEY_WARN("GetConfigStoreLocalBinary: retry failed or returned invalid size {} for KeyName='{}'",
+                                       result, keyName);
+                return {};
+            }
+        }
+
+        value.resize(static_cast<size_t>(result));
         LOG_DECRYPTIONKEY_DEBUG("GetConfigStoreLocalBinary: got value for KeyName='{}' ({} bytes)",
                                 keyName, value.size());
         return value;

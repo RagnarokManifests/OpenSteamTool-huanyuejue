@@ -384,12 +384,18 @@ namespace AppTicket {
         
         if (source == AppTicketSource::CredentialStoreOnly || source == AppTicketSource::CredentialStoreThenForge) {
             ticket.data = GetAppOwnershipTicketFromCredentialStore(appId);
-            if (!ticket.data.empty() && ticket.data.size() >= sizeof(uint32)) {
+            if (!ticket.data.empty() && ticket.data.size() >= kSteamIdTicketMinimumSize) {
                 ticket.totalSize = static_cast<uint32>(ticket.data.size());
                 ticket.appIdOffset = kAppTicketAppIdOffset;
                 ticket.steamIdOffset = kAppTicketSteamIdOffset;
                 ticket.signatureOffset = *reinterpret_cast<const uint32*>(ticket.data.data());
                 ticket.signatureSize = kAppTicketSignatureSize;
+                if (ticket.signatureOffset > ticket.totalSize ||
+                    ticket.signatureSize > (ticket.totalSize - ticket.signatureOffset)) {
+                    LOG_WARN("AppTicket: corrupted signature bounds for appId={}, sigOffset={}, sigSize={}, totalSize={}",
+                             appId, ticket.signatureOffset, ticket.signatureSize, ticket.totalSize);
+                    return false;
+                }
                 return true;
             }
         }

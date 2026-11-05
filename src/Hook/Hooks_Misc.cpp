@@ -1,7 +1,14 @@
 #include "Hooks_Misc.h"
 #include "HookMacros.h"
 #include "Utils/HookSupport/VehCommon.h"
+#include "Utils/CloudRedirect/CloudRedirectHost.h"
+#include "Utils/Config/LuaConfig.h"
 #include "dllmain.h"
+#include <algorithm>
+#include <atomic>
+#include <cctype>
+#include <cstring>
+#include <optional>
 
 namespace {
     // ── Resolve-only functions ─────────────────────────────────────
@@ -19,6 +26,38 @@ namespace {
     bool      g_NetworkingSocketsActive;
     // 本次启动是否用 -realappid 关掉 appid 翻转，见 ShouldReportOnlineFixAppId。
     bool      g_SuppressAppIdFlip;
+    // AppId the -onlinefix game is disguised as for this launch. 480 unless the
+    // launch options picked another with -onlinefix=<appid>. Read from Steam's
+    // IPC and network threads, so atomic.
+    std::atomic<AppId_t> g_OnlineFixFakeAppId{kOnlineFixAppId};
+
+    // Parse the AppId from "-onlinefix=<appid>", "-onlinefix:<appid>" or
+    // "-onlinefix <appid>". nullopt when the flag carries no number, in which
+    // case the default 480 applies. AppIds live in the low 24 bits of a
+    // CGameID, so anything wider is rejected.
+    static std::optional<AppId_t> ParseOnlineFixAppId(const char* flag) {
+        const char* p = flag + std::strlen("-onlinefix");
+        if (*p == '=' || *p == ':') {
+            ++p;
+        } else if (*p == ' ' || *p == '\t') {
+            while (*p == ' ' || *p == '\t') ++p;
+        } else {
+            return std::nullopt;
+        }
+        if (!std::isdigit(static_cast<unsigned char>(*p))) return std::nullopt;
+
+        uint64_t value = 0;
+        while (std::isdigit(static_cast<unsigned char>(*p))) {
+            value = value * 10 + static_cast<uint64_t>(*p - '0');
+            if (value > 0xFFFFFF) return std::nullopt;
+            ++p;
+        }
+        // The number has to end the token: "-onlinefix 12abc" is not an AppId.
+        if (*p != '\0' && *p != ' ' && *p != '\t' && *p != '"') return std::nullopt;
+        if (value == 0) return std::nullopt;
+        return static_cast<AppId_t>(value);
+    }
+
     std::unordered_map<AppId_t, std::string> g_GameNameCache;
 
 
@@ -29,38 +68,58 @@ namespace {
     // arg5=pGameID (CGameID*; low 24 bits = AppId)
     static void OnSpawnProcessHit(OSTPlatform::Trap::Context& ctx, const VehCommon::Int3Site& /*site*/) {
         CGameID* pGameID = VehCommon::GetArg<CGameID*>(ctx, 5);
+        if (!pGameID) return;
         AppId_t appId = static_cast<AppId_t>(pGameID->AppID(true));
         const char* cmdLine = VehCommon::GetArg<const char*>(ctx, 3);
+
+        // Resolve the stat SteamID in the background now, so a later
+        // GetStatSteamId on a hot path never blocks on HTTP.
+        LuaConfig::PrewarmStatSteamId(appId);
 
         // 每次命中均记录启动参数，用于区分 hook 未触发与启动参数缺失两种情况。
         LOG_MISC_DEBUG("SpawnProcess hit: appid {} cmd=\"{}\"", appId, cmdLine ? cmdLine : "<null>");
 
         // 只看启动参数，不再要求 appid 在 Lua 名单里：正版玩家加 -onlinefix
         // 联机同样要生效，解锁名单不该决定联机开关。
-        if (cmdLine && strstr(cmdLine, "-onlinefix"))
+        const char* onlineFixFlag = cmdLine ? strstr(cmdLine, "-onlinefix") : nullptr;
+        if (onlineFixFlag)
         {
+            // -onlinefix=<appid> disguises the game as that AppId instead of
+            // 480. Some games block 480 or flood its lobby list with other
+            // games' rooms; another free or owned AppId avoids both.
+            AppId_t fakeAppId = kOnlineFixAppId;
+            if (const auto custom = ParseOnlineFixAppId(onlineFixFlag)) {
+                if (*custom == appId) {
+                    LOG_MISC_WARN("SpawnProcess: -onlinefix={} is the game's own appid, using {}",
+                                  *custom, kOnlineFixAppId);
+                } else {
+                    fakeAppId = *custom;
+                }
+            }
+            g_OnlineFixFakeAppId.store(fakeAppId);
             g_OnlineFixRealAppId = appId;
             g_NetworkingSocketsActive = false;
             // 逐局关闭 appid 翻转：启动期就要读自己 appid 的游戏会卡在黑屏，
             // 这个调用本身分不出游戏意图，只能交给用户按局指定。
             g_SuppressAppIdFlip = strstr(cmdLine, "-realappid") != nullptr;
-            pGameID->SetAppID(kOnlineFixAppId);
+            pGameID->SetAppID(fakeAppId);
             LOG_MISC_INFO("SpawnProcess: appid {} -> {}, realappid={}, cmd=\"{}\"",
-                          appId, kOnlineFixAppId, g_SuppressAppIdFlip, cmdLine);
+                          appId, fakeAppId, g_SuppressAppIdFlip, cmdLine);
         } else {
             g_OnlineFixRealAppId = 0;
             g_SuppressAppIdFlip = false;
+            g_OnlineFixFakeAppId.store(kOnlineFixAppId);
         }
     }
 
     // ── SteamController_OptedInMask ──────────────────────────────────────────
     // Called by CUser_BuildSpawnEnvBlock with pGameID's appid to
     // compute EnableConfiguratorSupport and the SDL_* env vars.
-    // With 480 the spawned game inherits Spacewar's Steam Input
+    // With the fake AppId the spawned game inherits that app's Steam Input
     // opt-in and gameoverlayrenderer hijacks the XInput stream.
     HOOK_FUNC(OptedInMask, int64,void* pThis, AppId_t appId)
     {
-        if (appId == kOnlineFixAppId && g_OnlineFixRealAppId) {
+        if (g_OnlineFixRealAppId && appId == Hooks_Misc::GetOnlineFixAppId()) {
             LOG_MISC_INFO("OptedInMask: appid {} -> {}",appId, g_OnlineFixRealAppId);
             appId = g_OnlineFixRealAppId;
         }
@@ -71,14 +130,14 @@ namespace {
     // pOverlayCGameID drives SteamOverlayGameId, which the in-game
     // overlay reads for screenshot tags, community URLs, and asset
     // selection.  pCGameID drives SteamGameId / SteamAppId; leave it
-    // at 480 so the in-game ownership bypass holds.
+    // at the fake AppId so the in-game ownership bypass holds.
     HOOK_FUNC(BuildSpawnEnvBlock, int64,
               void* pThis, CGameID* pCGameID, void* a3, void* env,
               CGameID* pOverlayCGameID, void* a6, int a7,
               void* a8, void* a9, unsigned int a10, char a11)
     {
         if (g_OnlineFixRealAppId && pOverlayCGameID
-            && pOverlayCGameID->AppID(true) == kOnlineFixAppId) 
+            && pOverlayCGameID->AppID(true) == Hooks_Misc::GetOnlineFixAppId())
         {
             LOG_MISC_INFO("BuildSpawnEnvBlock: SetAppID in OverlayCGameID {} -> {}",
                           pOverlayCGameID->AppID(true), g_OnlineFixRealAppId);
@@ -160,11 +219,18 @@ namespace Hooks_Misc {
         return g_OnlineFixRealAppId != 0;
     }
 
+    AppId_t GetOnlineFixAppId() {
+        return g_OnlineFixFakeAppId.load();
+    }
+
     void NotifyNetworkingSocketsUsed() {
         if (g_OnlineFixRealAppId && !g_NetworkingSocketsActive) {
             g_NetworkingSocketsActive = true;
-            LOG_MISC_INFO("NetworkingSockets active: GetAppID now reports {}",
-                          g_SuppressAppIdFlip ? "real appid (-realappid)" : "480 for cert match");
+            if (g_SuppressAppIdFlip)
+                LOG_MISC_INFO("NetworkingSockets active: GetAppID keeps the real appid (-realappid)");
+            else
+                LOG_MISC_INFO("NetworkingSockets active: GetAppID now reports {} for cert match",
+                              GetOnlineFixAppId());
         }
     }
 
@@ -206,8 +272,12 @@ namespace Hooks_Misc {
             // Returns strlen+1 on success, -1 on failure.
             int64 len = oGetAppDataFromAppInfo(g_pCAppInfoCache, appId, "common/name",
                 reinterpret_cast<uint8*>(buf), sizeof(buf));
-            if (len > 1)
-                name.assign(buf, static_cast<size_t>(len - 1));
+            if (len > 1) {
+                // Steam may report a length beyond the buffer it was given;
+                // clamp so name.assign() cannot read past buf.
+                const size_t copyLen = (std::min)(static_cast<size_t>(len - 1), sizeof(buf) - 1);
+                name.assign(buf, copyLen);
+            }
         }
 
         LOG_MISC_DEBUG("GetGameNameByAppID({}): {}", appId, name);

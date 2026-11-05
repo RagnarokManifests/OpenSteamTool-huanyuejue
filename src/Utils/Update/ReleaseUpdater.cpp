@@ -47,6 +47,7 @@ namespace {
     // disabled; when the user enabled it, the live file is version.dll.
     constexpr const char* kKnownAssets[] = {
         "OpenSteamTool.dll", "dwmapi.dll", "xinput1_4.dll", "version.dll.disabled",
+        "cloud_redirect.dll",
     };
 
     struct Asset {

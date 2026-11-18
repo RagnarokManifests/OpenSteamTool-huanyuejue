@@ -9,13 +9,14 @@
 namespace Mirror {
 
 namespace {
-    // Delivery mirror chain for the `updates` branch of eisora08/OpenSteamTool.
+    // Delivery mirror chain for the `updates` branch of
+    // RagnarokManifests/OpenSteamTool-huanyuejue.
     // Independent hosts (not just CDN copies of one repo), tried in order until one
     // returns HTTP 200. github-raw first for pointer freshness; jsDelivr covers
     // regions where raw.githubusercontent is throttled/blocked.
     constexpr const char* kBaseTemplates[] = {
-        "https://raw.githubusercontent.com/eisora08/OpenSteamTool/updates/{path}",
-        "https://cdn.jsdelivr.net/gh/eisora08/OpenSteamTool@updates/{path}",
+        "https://raw.githubusercontent.com/RagnarokManifests/OpenSteamTool-huanyuejue/updates/{path}",
+        "https://cdn.jsdelivr.net/gh/RagnarokManifests/OpenSteamTool-huanyuejue@updates/{path}",
     };
 
     std::string Expand(std::string tmpl, std::string_view relPath)

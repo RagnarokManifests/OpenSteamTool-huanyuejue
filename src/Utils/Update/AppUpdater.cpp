@@ -18,6 +18,7 @@
 #include <string>
 #include <string_view>
 #include <system_error>
+#include <vector>
 
 namespace AppUpdater {
 
@@ -46,6 +47,49 @@ namespace {
         for (size_t p = s.find('\''); p != std::string::npos; p = s.find('\'', p + 2))
             s.insert(p, 1, '\'');
         return s;
+    }
+
+    // Parse a dotted version string ("1.5.7", "v1.4.8.9") into numeric
+    // components, ignoring a leading 'v'/'V' and any non-numeric suffix.
+    // Returns an empty vector on a string with no leading numeric component.
+    std::vector<uint64_t> ParseVersion(std::string_view v)
+    {
+        std::vector<uint64_t> out;
+        size_t i = 0;
+        // Skip an optional leading 'v'.
+        if (i < v.size() && (v[i] == 'v' || v[i] == 'V')) ++i;
+        while (i < v.size()) {
+            uint64_t n = 0;
+            bool got = false;
+            while (i < v.size() && std::isdigit(static_cast<unsigned char>(v[i]))) {
+                n = n * 10 + static_cast<uint64_t>(v[i] - '0');
+                ++i;
+                got = true;
+            }
+            if (!got) break;          // non-numeric component stops the parse
+            out.push_back(n);
+            if (i < v.size() && v[i] == '.') ++i;
+            else break;
+        }
+        return out;
+    }
+
+    // Returns true when `remote` is strictly newer than `current` using numeric
+    // component comparison (1.5.7 > 1.5.6, 1.5.7 > v1.4.8.9). Missing trailing
+    // components are treated as zero, so 1.5 == 1.5.0.
+    bool IsRemoteNewer(std::string_view remote, std::string_view current)
+    {
+        const std::vector<uint64_t> r = ParseVersion(remote);
+        const std::vector<uint64_t> c = ParseVersion(current);
+        if (r.empty() || c.empty()) return false;   // unparseable: never auto-update
+        const size_t n = std::max(r.size(), c.size());
+        for (size_t i = 0; i < n; ++i) {
+            const uint64_t rv = i < r.size() ? r[i] : 0;
+            const uint64_t cv = i < c.size() ? c[i] : 0;
+            if (rv > cv) return true;
+            if (rv < cv) return false;
+        }
+        return false; // equal
     }
 } // namespace
 
@@ -80,10 +124,17 @@ CheckResult Check()
     r.dllRelPath = *path;
     r.sha256     = *sha;
 
-    // latest.toml is authoritative for "newest"; build tags are not semver, so any
-    // difference from the running version means there is something new to stage.
+    // Only stage when the remote version is strictly newer. Build tags are
+    // dotted numbers (1.5.7, v1.4.8.9) so we compare components numerically;
+    // an equal or older remote is left alone, which also prevents a stale
+    // pointer on another fork from silently downgrading this build.
     if (r.newVersion == r.oldVersion) {
         LOG_INFO("AppUpdater: up to date (version {})", r.oldVersion);
+        return r;
+    }
+    if (!IsRemoteNewer(r.newVersion, r.oldVersion)) {
+        LOG_INFO("AppUpdater: remote {} is not newer than running {}; skipping",
+                 r.newVersion, r.oldVersion);
         return r;
     }
 

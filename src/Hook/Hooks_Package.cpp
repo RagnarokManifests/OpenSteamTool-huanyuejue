@@ -7,6 +7,7 @@
 #include <atomic>
 #include <mutex>
 #include <string>
+#include <unordered_map>
 #include <unordered_set>
 #include <vector>
 
@@ -22,6 +23,13 @@ namespace {
     std::atomic<PackageInfo*>  g_pInjectedPackageInfo{nullptr};
     std::atomic<bool>          g_licenseInitialized{false};
     std::atomic<bool>          g_licenseRefreshPending{false};
+
+    // Lender accountid per appid, written before the borrow flags are cleared
+    // and SteamId32 is zeroed. After that point a borrowed game looks exactly
+    // like one we forged, and this table is the only thing left that separates
+    // them — the UI uses it to leave the shared-source banner alone.
+    std::unordered_map<AppId_t, AccountID_t> g_familySharedOwners;
+    std::mutex                 g_familySharedOwnersMutex;
 
     constexpr PackageId_t kInjectedPackageId = 0;
     constexpr uint64_t kInjectedPkgAccessToken = 10660652434190618804ull;
@@ -218,6 +226,31 @@ namespace {
         TryProcessPendingLicenseRefresh();
         Hooks_Package::TryDumpOwnedDepots();
 
+        // Record the lender before anything below clears the borrow flags or
+        // zeroes SteamId32 — after that this appid is indistinguishable from a
+        // forged one. Trust the borrow flags only: once cleared, Steam rewrites
+        // SteamId32 too, so it cannot be used to recognise the app later. The
+        // entry is written once and never removed; a missed record would make
+        // a real borrow look self-owned, so leaving a stale one is safer.
+        if (pEffectiveOwn->SteamId32 != 0 &&
+            (pEffectiveOwn->bFamilyShared || pEffectiveOwn->bBorrowed))
+        {
+            bool recorded = false;
+            {
+                std::lock_guard<std::mutex> lock(g_familySharedOwnersMutex);
+                AccountID_t& slot = g_familySharedOwners[appId];
+                if (slot != pEffectiveOwn->SteamId32)
+                {
+                    slot = pEffectiveOwn->SteamId32;
+                    recorded = true;
+                }
+            }
+            if (recorded)
+                LOG_PACKAGE_INFO("FamilySharing: recorded lender {} for AppId={} (familyShared={} borrowed={})",
+                                 pEffectiveOwn->SteamId32, appId,
+                                 pEffectiveOwn->bFamilyShared, pEffectiveOwn->bBorrowed);
+        }
+
         // A real (non-injected, unexpired) shared license counts as owned so
         // family-shared games stay playable without the lock flags.
         const bool isSharedLicense = (pEffectiveOwn->bFamilyShared || pEffectiveOwn->bBorrowed) &&
@@ -318,6 +351,12 @@ namespace Hooks_Package {
         UNHOOK_BEGIN();
         UNINSTALL_HOOK_C(CheckAppOwnership);
         UNHOOK_END();
+    }
+
+    AccountID_t GetFamilySharedOwner(AppId_t appId) {
+        std::lock_guard<std::mutex> lock(g_familySharedOwnersMutex);
+        auto it = g_familySharedOwners.find(appId);
+        return it == g_familySharedOwners.end() ? 0 : it->second;
     }
 
     void NotifyLicenseChanged() {

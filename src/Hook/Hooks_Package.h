@@ -33,6 +33,12 @@ namespace Hooks_Package {
     // CheckAppOwnership, which runs often enough to guarantee both eventually.
     void TryDumpOwnedDepots();
 
+    // Lender accountid recorded for an appid, 0 when it is not a family-shared
+    // borrow or nothing was recorded. The ownership hook zeroes SteamId32 for
+    // forged licenses, so this table is what still tells a genuinely borrowed
+    // game apart from one we made up.
+    AccountID_t GetFamilySharedOwner(AppId_t appId);
+
     // Every depot id reachable through the account's licenses.
     //
     // `ready` distinguishes "not resolved yet" from "owns nothing" — before the

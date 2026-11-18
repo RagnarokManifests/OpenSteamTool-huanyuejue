@@ -1,10 +1,14 @@
 #include "Hooks_SteamUI.h"
+#include "Hooks_Package.h"
+#include "OSTPlatform/include/SteamCredentialStore.h"
 #include "HookManager.h"
 #include "HookMacros.h"
 #include "dllmain.h"
 #include "steam_messages.pb.h"
 #include "Utils/HookSupport/VehCommon.h"
+#include <atomic>
 #include <mutex>
+#include <string>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -26,6 +30,12 @@ namespace
     // game updates. Same lock and update site as g_activeDl.
     std::unordered_set<AppId_t> g_updating;
     std::unordered_map<AppId_t, AppId_t> g_parentApp;
+
+    // Current account, read once and cached: this fill-in runs on every
+    // overview refresh and the account cannot change while the process lives,
+    // so re-reading the registry each time buys nothing. Cleared on uninstall
+    // so a hot reload does not carry the previous session's value over.
+    std::atomic<uint32_t> g_selfAccountId{0};
 
     HOOK_FUNC(FillInAppOverview, void *, void *pThis, void *pAppOverview, CSteamApp *pApp)
     {
@@ -67,6 +77,35 @@ namespace
 
             if (LuaConfig::HasDepot(pApp->nAppID, false))
             {
+                // A forged license has no real owner: Steam stamps the overview
+                // with an empty identity (accountid 0) and the details page reads
+                // that as "borrowed from someone else", showing the "from your
+                // Steam Family Library" banner — intermittently, since the fill-in
+                // runs again on every refresh. Stamp the current account instead.
+                // Games genuinely borrowed from a family member keep their lender
+                // record, so they are left untouched and still show their source.
+                if (pApp->SteamID.GetAccountID() == 0 &&
+                    Hooks_Package::GetFamilySharedOwner(pApp->nAppID) == 0)
+                {
+                    uint32_t selfAccount = g_selfAccountId.load(std::memory_order_relaxed);
+                    if (selfAccount == 0)
+                    {
+                        std::wstring universe;
+                        if (OSTPlatform::SteamCredentialStore::GetActiveUser(selfAccount, universe) ==
+                            OSTPlatform::SteamCredentialStore::Status::Ok)
+                            g_selfAccountId.store(selfAccount, std::memory_order_relaxed);
+                        else
+                            selfAccount = 0;
+                    }
+
+                    if (selfAccount != 0)
+                    {
+                        pApp->SteamID.Set(selfAccount, k_EUniversePublic, k_EAccountTypeIndividual);
+                        LOG_STEAMUI_DEBUG("FillInAppOverview: appId={} owner set to self ({})",
+                                          pApp->nAppID, selfAccount);
+                    }
+                }
+
                 uint32_t t = LuaConfig::GetPurchaseTime(pApp->nAppID);
                 if (t)
                 {
@@ -156,6 +195,9 @@ namespace Hooks_SteamUI
 
     void Uninstall()
     {
+        // Re-read the account after a hot reload instead of reusing the value
+        // cached by the previous install.
+        g_selfAccountId.store(0, std::memory_order_relaxed);
         UNHOOK_BEGIN();
         UNINSTALL_HOOK(FillInAppOverview);
         UNINSTALL_HOOK(BuildCompleteAppOverviewChange);

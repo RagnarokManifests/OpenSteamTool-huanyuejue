@@ -7,13 +7,9 @@
 //   * GetAppIDForCurrentPipe  -> captures the SteamEngine pointer
 //   * SpawnProcess            -> OnlineFix detection + 480 rewrite
 //   * GetAppDataFromAppInfo   -> captures the CAppInfoCache pointer
-    inline constexpr AppId_t kOnlineFixAppId = 480;
+namespace Hooks_Misc {
+    using ::kOnlineFixAppId;
 
-    // Catch-all for lightweight info-capture int3 traps and launch-time rewrites
-    // that don't fit a dedicated category — currently:
-    //   * GetAppIDForCurrentPipe  -> captures the SteamEngine pointer
-    //   * SpawnProcess            -> OnlineFix detection + 480 rewrite
-    //   * GetAppDataFromAppInfo   -> captures the CAppInfoCache pointer
     void Install();
     void Uninstall();
 
